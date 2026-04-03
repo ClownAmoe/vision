@@ -34,8 +34,6 @@ class KITTIOdometryParser:
             )
         self._length = min(len(self.image_paths), len(self.poses))
 
-    # Private methods
-
     def _validate_paths(self) -> None:
         if not self.images_dir.exists():
             raise FileNotFoundError(f"Images folder not found: {self.images_dir}")
@@ -49,8 +47,6 @@ class KITTIOdometryParser:
         poses_4x4[:, :3, :] = raw.reshape(-1, 3, 4)
         poses_4x4[:, 3, 3] = 1.0
         return poses_4x4
-
-    # Public API
 
     def __len__(self) -> int:
         return self._length
@@ -70,9 +66,6 @@ class KITTIOdometryParser:
         """Дозволяє: for image, pose in parser: ..."""
         for i in range(self._length):
             yield self[i]
-
-    # ---- зручні властивості ------------------------------------------ #
-
 
     @property
     def translations(self) -> np.ndarray:
@@ -106,38 +99,27 @@ class KITTIOdometryParser:
             f"  Poses file: {self.poses_file}\n"
         )
 
-
-# ======================================================================= #
-#  Приклад використання                                                    #
-# ======================================================================= #
-
 if __name__ == "__main__":
-    # ── налаштування ────────────────────────────────────────────────────
-    DATASET_PATH = "dataset/"   # <-- змініть на свій шлях
+    DATASET_PATH = "dataset/"
     SEQUENCE     = "00"
-    CAMERA       = "image_0"          # grayscale; "image_2" для кольорових
-    # ────────────────────────────────────────────────────────────────────
+    CAMERA       = "image_0"
 
     parser = KITTIOdometryParser(DATASET_PATH, sequence=SEQUENCE, camera=CAMERA)
     print(parser.summary())
 
-    # --- Варіант 1: ітерація через усі кадри ----------------------------
     for idx, (image, pose) in enumerate(parser):
         print(f"[{idx:04d}] image shape: {image.shape}  |  t = {pose[:3, 3]}")
-        if idx == 4:          # для демонстрації зупиняємось на 5-му кадрі
+        if idx == 4:
             print("  ...")
             break
 
-    # --- Варіант 2: звернення за індексом --------------------------------
     img, T = parser[10]
     print(f"\nКадр 10:")
     print(f"  Зображення : {img.shape}, dtype={img.dtype}")
     print(f"  Поза (4×4):\n{T}")
 
-    # --- Варіант 3: відносна трансформація між кадрами 0 та 10 ----------
     T_rel = parser.relative_pose(0, 10)
     print(f"\nВідносна трансформація [0→10]:\n{T_rel}")
 
-    # --- Масиви всіх позицій (для побудови траєкторії) ------------------
-    xyz = parser.translations        # (N, 3)
+    xyz = parser.translations
     print(f"\nТраєкторія: {xyz.shape[0]} точок, X ∈ [{xyz[:,0].min():.1f}, {xyz[:,0].max():.1f}]")

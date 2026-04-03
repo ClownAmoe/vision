@@ -15,40 +15,30 @@ import matplotlib.pyplot as plt
 import argparse
 import logging
 
-# Configure logging to output to console
 logging.basicConfig(level=logging.INFO, format='%(message)s', handlers=[logging.StreamHandler()])
-
-# ══════════════════════════════════════════════════════════════════════════
-# Типи
-# ══════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class PoseEstimate:
     """Результат оцінки руху між двома кадрами."""
-    R:              np.ndarray      # (3, 3) матриця обертання
-    t:              np.ndarray      # (3, 1) вектор трансляції (одиничний)
-    t_scaled:       np.ndarray      # (3, 1) вектор з реальним масштабом
-    scale:          float           # евклідова відстань між позами GT
-    inliers_mask:   np.ndarray      # маска RANSAC-інлаєрів
-    n_inliers:      int             # кількість інлаєрів
+    R:              np.ndarray
+    t:              np.ndarray
+    t_scaled:       np.ndarray
+    scale:          float
+    inliers_mask:   np.ndarray
+    n_inliers:      int
 
 
 @dataclass
 class TrajectoryState:
     """Накопичена глобальна позиція камери."""
-    R_pos: np.ndarray = None    # поточна орієнтація (3×3)
-    t_pos: np.ndarray = None    # поточна позиція   (3×1)
+    R_pos: np.ndarray = None
+    t_pos: np.ndarray = None
 
     def __post_init__(self):
         if self.R_pos is None:
             self.R_pos = np.eye(3, dtype=np.float64)
         if self.t_pos is None:
             self.t_pos = np.zeros((3, 1), dtype=np.float64)
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# Парсер матриці калібрування
-# ══════════════════════════════════════════════════════════════════════════
 
 def load_camera_matrix(calib_path: str | Path, camera_id: int = 0) -> np.ndarray:
     """
@@ -69,9 +59,7 @@ def load_camera_matrix(calib_path: str | Path, camera_id: int = 0) -> np.ndarray
         for line in f:
             if line.startswith(key):
                 vals = list(map(float, line.strip().split()[1:]))
-                # vals — 12 чисел проєкційної матриці 3×4
                 P = np.array(vals).reshape(3, 4)
-                # Внутрішня матриця — перші 3 стовпці
                 K = P[:3, :3]
                 return K
 
@@ -79,11 +67,6 @@ def load_camera_matrix(calib_path: str | Path, camera_id: int = 0) -> np.ndarray
         f"Рядок '{key}' не знайдено у файлі {calib_path}. "
         f"Доступні ключі: P0 … P3 (camera_id=0..3)"
     )
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# Обчислення масштабу з Ground Truth
-# ══════════════════════════════════════════════════════════════════════════
 
 def compute_scale(pose_prev: np.ndarray, pose_curr: np.ndarray) -> float:
     """
@@ -100,11 +83,6 @@ def compute_scale(pose_prev: np.ndarray, pose_curr: np.ndarray) -> float:
     t_prev = pose_prev[:3, 3]
     t_curr = pose_curr[:3, 3]
     return float(np.linalg.norm(t_curr - t_prev))
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# Основний клас
-# ══════════════════════════════════════════════════════════════════════════
 
 class MotionEstimator:
     """
@@ -137,7 +115,6 @@ class MotionEstimator:
             x, z = state.t_pos[0, 0], state.t_pos[2, 0]
     """
 
-    # Мінімальна відстань між кадрами, щоб оновлювати позу
     MIN_SCALE: float = 0.1
 
     def __init__(
@@ -157,11 +134,8 @@ class MotionEstimator:
         self.ransac_prob      = ransac_prob
         self.ransac_threshold = ransac_threshold
 
-        # Параметри для cv2.findEssentialMat
         self._focal = float(K[0, 0])
-        self._pp    = (float(K[0, 2]), float(K[1, 2]))   # principal point
-
-    # ── оцінка між парою кадрів ───────────────────────────────────────────
+        self._pp    = (float(K[0, 2]), float(K[1, 2]))
 
     def estimate(
         self,
@@ -184,11 +158,9 @@ class MotionEstimator:
         """
         scale = compute_scale(pose_prev, pose_curr)
 
-        # Пропускаємо статичні кадри
         if scale < self.MIN_SCALE:
             return None
 
-        # ── Essential Matrix ─────────────────────────────────────────────
         E, mask = cv2.findEssentialMat(
             pts_curr,
             pts_prev,
@@ -201,7 +173,6 @@ class MotionEstimator:
         if E is None:
             return None
 
-        # ── Pose Recovery ────────────────────────────────────────────────
         n_inliers, R, t, mask_pose = cv2.recoverPose(
             E,
             pts_curr,
@@ -224,8 +195,6 @@ class MotionEstimator:
             inliers_mask = mask_pose.ravel().astype(bool),
             n_inliers    = n_inliers,
         )
-
-    # ── оновлення глобальної траєкторії ───────────────────────────────────
 
     @staticmethod
     def update_trajectory(
@@ -253,14 +222,9 @@ class MotionEstimator:
 
         return TrajectoryState(R_pos=new_R, t_pos=new_t)
 
-
-# ══════════════════════════════════════════════════════════════════════════
-# Збірний пайплайн: feature matching + motion estimation
-# ══════════════════════════════════════════════════════════════════════════
-
 def run_odometry_pipeline(
-    parser,                     # KITTIOdometryParser
-    feature_matcher,            # FeatureMatcher
+    parser,
+    feature_matcher,
     estimator: MotionEstimator,
     max_frames: Optional[int] = None,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -283,15 +247,12 @@ def run_odometry_pipeline(
         img_prev, pose_prev = parser[idx - 1]
         img_curr, pose_curr = parser[idx]
 
-        # Зіставлення ключових точок
         match_result = feature_matcher.match(img_prev, img_curr)
         if match_result is None:
-            # Якщо збігів немає — залишаємо поточну позицію
             estimated_traj[idx] = estimated_traj[idx - 1]
             gt_traj[idx]        = pose_curr[:3, 3]
             continue
 
-        # Оцінка руху
         estimate = estimator.estimate(
             match_result.pts_prev,
             match_result.pts_curr,
@@ -315,13 +276,7 @@ def run_odometry_pipeline(
 
     return estimated_traj, gt_traj
 
-
-# ══════════════════════════════════════════════════════════════════════════
-# Демонстрація (без реального датасету)
-# ══════════════════════════════════════════════════════════════════════════
-
 if __name__ == "__main__":
-    # Додано аргументи командного рядка
     parser_args = argparse.ArgumentParser(description="Motion Estimation with KITTI Dataset")
     parser_args.add_argument(
         "--max_frames", type=int, default=None,
@@ -329,42 +284,34 @@ if __name__ == "__main__":
     )
     args = parser_args.parse_args()
 
-    # Налаштування датасету
-    DATASET_PATH = "dataset/"  # Шлях до датасету
-    SEQUENCE = "00"           # Номер послідовності
-    CAMERA = "image_0"        # Камера (image_0 для grayscale)
+    DATASET_PATH = "dataset/"
+    SEQUENCE = "00"
+    CAMERA = "image_0"
 
-    # Ініціалізація парсера
     parser = KITTIOdometryParser(DATASET_PATH, sequence=SEQUENCE, camera=CAMERA)
     logging.info(parser.summary())
 
-    # Завантаження матриці камери
     calib_path = DATASET_PATH + f"sequences/{SEQUENCE}/calib.txt"
     K = load_camera_matrix(calib_path, camera_id=0)
     logging.info("Матриця камери K:")
     logging.info(K)
 
-    # Ініціалізація оцінювача руху та зіставлення ознак
     estimator = MotionEstimator(K)
-    matcher = FeatureMatcher(DetectorType.SIFT)  # Можна змінити на SURF або ORB
+    matcher = FeatureMatcher(DetectorType.SIFT)
 
-    # Ініціалізація траєкторії
     state = TrajectoryState()
 
-    # Обмеження кількості кадрів
     max_frames = args.max_frames if args.max_frames is not None else len(parser)
 
     for idx in range(1, max_frames):
         img_prev, pose_prev = parser[idx - 1]
         img_curr, pose_curr = parser[idx]
 
-        # Зіставлення ключових точок
         match_result = matcher.match(img_prev, img_curr)
         if match_result is None:
             logging.warning(f"[{idx:04d}] Недостатньо збігів")
             continue
 
-        # Оцінка руху
         estimate = estimator.estimate(
             match_result.pts_prev,
             match_result.pts_curr,
@@ -378,10 +325,8 @@ if __name__ == "__main__":
         x, z = state.t_pos[0, 0], state.t_pos[2, 0]
         logging.info(f"[{idx:04d}] Позиція: x={x:.2f}, z={z:.2f}")
 
-    # Запуск пайплайну з обмеженням кількості кадрів
     estimated_traj, gt_traj = run_odometry_pipeline(parser, matcher, estimator, max_frames=max_frames)
 
-    # Візуалізація траєкторій
     plt.figure(figsize=(10, 6))
     plt.plot(gt_traj[:, 0], gt_traj[:, 2], label="Ground Truth", color="green")
     plt.plot(estimated_traj[:, 0], estimated_traj[:, 2], label="Estimated", color="blue", linestyle="--")

@@ -13,11 +13,6 @@ import numpy as np
 import os
 from parser import KITTIOdometryParser
 
-
-# ══════════════════════════════════════════════════════════════════════════
-# Типи
-# ══════════════════════════════════════════════════════════════════════════
-
 class DetectorType(Enum):
     SIFT = auto()
     SURF = auto()
@@ -27,18 +22,13 @@ class DetectorType(Enum):
 @dataclass
 class MatchResult:
     """Результат зіставлення між двома кадрами."""
-    pts_prev:       np.ndarray          # (N, 2) — точки на кадрі t-1
-    pts_curr:       np.ndarray          # (N, 2) — точки на кадрі t
-    kp_prev:        list                # повний список keypoints (кадр t-1)
-    kp_curr:        list                # повний список keypoints (кадр t)
-    good_matches:   list                # відфільтровані DMatch-об'єкти
-    elapsed_ms:     float = 0.0         # час обробки пари кадрів (мс)
+    pts_prev:       np.ndarray
+    pts_curr:       np.ndarray
+    kp_prev:        list
+    kp_curr:        list
+    good_matches:   list
+    elapsed_ms:     float = 0.0
     detector_name:  str   = ""
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# Допоміжні функції
-# ══════════════════════════════════════════════════════════════════════════
 
 def _build_flann_matcher(detector: DetectorType) -> cv2.FlannBasedMatcher:
     """FLANN для SIFT / SURF (float-дескриптори)."""
@@ -79,31 +69,15 @@ def _matched_points(
     pts_curr = np.float32([kp_curr[m.trainIdx].pt for m in good_matches])
     return pts_prev, pts_curr
 
-
-# ══════════════════════════════════════════════════════════════════════════
-# Основний клас
-# ══════════════════════════════════════════════════════════════════════════
-
 class FeatureMatcher:
-    """
-    Уніфікований інтерфейс для SIFT, SURF та ORB.
-
-    Приклад використання:
-        matcher = FeatureMatcher(DetectorType.SIFT)
-        result  = matcher.match(frame_prev, frame_curr)
-        print(f"Знайдено {len(result.good_matches)} збігів")
-    """
 
     def __init__(
         self,
         detector_type: DetectorType = DetectorType.ORB,
         ratio_threshold: float = 0.75,
-        # ORB-specific
         orb_n_features: int = 3000,
-        # SURF-specific
         surf_hessian_threshold: float = 400.0,
-        # SIFT-specific
-        sift_n_features: int = 0,           # 0 = без обмежень
+        sift_n_features: int = 0,
     ):
         self.detector_type   = detector_type
         self.ratio_threshold = ratio_threshold
@@ -111,8 +85,6 @@ class FeatureMatcher:
             detector_type, orb_n_features, surf_hessian_threshold, sift_n_features
         )
         self.matcher         = self._init_matcher(detector_type)
-
-    # ── ініціалізація ─────────────────────────────────────────────────────
 
     @staticmethod
     def _init_detector(
@@ -124,7 +96,6 @@ class FeatureMatcher:
         if det_type == DetectorType.SIFT:
             return cv2.SIFT_create(nfeatures=sift_n)
         elif det_type == DetectorType.SURF:
-            # SURF вимагає opencv-contrib-python
             return cv2.xfeatures2d.SURF_create(hessianThreshold=surf_thresh)
         elif det_type == DetectorType.ORB:
             return cv2.ORB_create(nfeatures=orb_n)
@@ -135,10 +106,8 @@ class FeatureMatcher:
     def _init_matcher(det_type: DetectorType):
         if det_type in (DetectorType.SIFT, DetectorType.SURF):
             return _build_flann_matcher(det_type)
-        else:  # ORB
+        else:
             return _build_bf_matcher()
-
-    # ── основний метод ────────────────────────────────────────────────────
 
     def match(
         self,
@@ -165,7 +134,6 @@ class FeatureMatcher:
         gray_prev = self._to_gray(img_prev)
         gray_curr = self._to_gray(img_curr)
 
-        # 1. Виявлення ключових точок та дескрипторів
         kp_prev, des_prev = self.detector.detectAndCompute(gray_prev, None)
         kp_curr, des_curr = self.detector.detectAndCompute(gray_curr, None)
 
@@ -174,11 +142,9 @@ class FeatureMatcher:
         if len(kp_prev) < min_matches or len(kp_curr) < min_matches:
             return None
 
-        # 2. Зіставлення (kNN з k=2 для ratio test)
         des_prev, des_curr = self._ensure_float(des_prev, des_curr)
         raw_matches = self.matcher.knnMatch(des_prev, des_curr, k=2)
 
-        # 3. Фільтрація за тестом Лоу
         good_matches = _lowe_ratio_test(raw_matches, self.ratio_threshold)
 
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
@@ -198,8 +164,6 @@ class FeatureMatcher:
             detector_name = self.detector_type.name,
         )
 
-    # ── утиліти ───────────────────────────────────────────────────────────
-
     @staticmethod
     def _to_gray(img: np.ndarray) -> np.ndarray:
         """BGR → grayscale (якщо вже grayscale — без змін)."""
@@ -212,12 +176,10 @@ class FeatureMatcher:
         des_prev: np.ndarray,
         des_curr: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """FLANN вимагає float32; ORB повертає uint8 — але ми використовуємо BF."""
+        """FLANN вимагає float32."""
         if self.detector_type in (DetectorType.SIFT, DetectorType.SURF):
             return des_prev.astype(np.float32), des_curr.astype(np.float32)
         return des_prev, des_curr
-
-    # ── візуалізація ──────────────────────────────────────────────────────
 
     def draw_matches(
         self,
@@ -243,13 +205,7 @@ class FeatureMatcher:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         return vis
 
-
-# ══════════════════════════════════════════════════════════════════════════
-# Швидкий тест без датасету
-# ══════════════════════════════════════════════════════════════════════════
-
 if __name__ == "__main__":
-    # Генеруємо два синтетичні кадри для демонстрації роботи модуля
     np.random.seed(42)
     dummy = (np.random.rand(480, 640) * 255).astype(np.uint8)
 
@@ -265,19 +221,16 @@ if __name__ == "__main__":
         except cv2.error as e:
             print(f"{det.name:4s}: недоступний ({e})")
 
-    # Налаштування датасету
-    DATASET_PATH = "dataset/"  # Шлях до датасету
-    SEQUENCE = "00"           # Номер послідовності
-    CAMERA = "image_0"        # Камера (image_0 для grayscale)
+    DATASET_PATH = "dataset/"
+    SEQUENCE = "00"
+    CAMERA = "image_0"
 
-    # Ініціалізація парсера
     parser = KITTIOdometryParser(DATASET_PATH, sequence=SEQUENCE, camera=CAMERA)
     print(parser.summary())
 
-    # Використання FeatureMatcher для кожної пари кадрів
-    matcher = FeatureMatcher(DetectorType.SIFT)  # Можна змінити на SURF або ORB
+    matcher = FeatureMatcher(DetectorType.SIFT)
 
-    for idx in range(len(parser) - 1):
+    for idx in range(100):
         img_prev, pose_prev = parser[idx]
         img_curr, pose_curr = parser[idx + 1]
 
@@ -285,5 +238,13 @@ if __name__ == "__main__":
         if result:
             print(f"[{idx:04d}] Знайдено {len(result.good_matches)} збігів | "
                   f"{result.elapsed_ms:.1f} мс")
+            vis = matcher.draw_matches(img_prev, img_curr, result, max_draw=80)
+            cv2.imshow("Feature Matches", vis)
         else:
             print(f"[{idx:04d}] Недостатньо збігів")
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("q"):
+            break
+
+    cv2.destroyAllWindows()
