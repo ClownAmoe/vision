@@ -6,12 +6,12 @@ Feature Extraction & Matching — SIFT / SURF / ORB
 import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Optional
+from typing import Optional, Tuple
 
 import cv2
 import numpy as np
 import os
-from parser import KITTIOdometryParser
+from kitti_parser import KITTIOdometryParser
 
 class DetectorType(Enum):
     SIFT = auto()
@@ -63,7 +63,7 @@ def _matched_points(
     kp_prev: list,
     kp_curr: list,
     good_matches: list,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray]:
     """Перетворює DMatch-об'єкти на масиви координат."""
     pts_prev = np.float32([kp_prev[m.queryIdx].pt for m in good_matches])
     pts_curr = np.float32([kp_curr[m.trainIdx].pt for m in good_matches])
@@ -94,7 +94,7 @@ class FeatureMatcher:
         sift_n: int,
     ):
         if det_type == DetectorType.SIFT:
-            return cv2.SIFT_create(nfeatures=sift_n)
+            return cv2.xfeatures2d.SIFT_create(nfeatures=sift_n)
         elif det_type == DetectorType.SURF:
             return cv2.xfeatures2d.SURF_create(hessianThreshold=surf_thresh)
         elif det_type == DetectorType.ORB:
@@ -175,7 +175,7 @@ class FeatureMatcher:
         self,
         des_prev: np.ndarray,
         des_curr: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """FLANN вимагає float32."""
         if self.detector_type in (DetectorType.SIFT, DetectorType.SURF):
             return des_prev.astype(np.float32), des_curr.astype(np.float32)

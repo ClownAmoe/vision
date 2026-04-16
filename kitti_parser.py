@@ -2,7 +2,7 @@ import os
 import numpy as np
 import cv2
 from pathlib import Path
-from typing import Iterator, Tuple, Optional
+from typing import Iterator, Tuple, Optional, List
 
 
 class KITTIOdometryParser:
@@ -24,7 +24,7 @@ class KITTIOdometryParser:
 
         self._validate_paths()
 
-        self.image_paths: list[Path] = sorted(self.images_dir.glob("*.png"))
+        self.image_paths: List[Path] = sorted(self.images_dir.glob("*.png"))
         self.poses: np.ndarray = self._load_poses()
 
         if len(self.image_paths) != len(self.poses):

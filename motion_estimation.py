@@ -5,11 +5,11 @@ Essential Matrix → Pose Recovery (R, t) з масштабом із Ground Trut
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple, Union
 
 import cv2
 import numpy as np
-from parser import KITTIOdometryParser
+from kitti_parser import KITTIOdometryParser
 from feature_matching import FeatureMatcher, DetectorType
 import matplotlib.pyplot as plt
 import argparse
@@ -40,7 +40,7 @@ class TrajectoryState:
         if self.t_pos is None:
             self.t_pos = np.zeros((3, 1), dtype=np.float64)
 
-def load_camera_matrix(calib_path: str | Path, camera_id: int = 0) -> np.ndarray:
+def load_camera_matrix(calib_path: Union[str, Path], camera_id: int = 0) -> np.ndarray:
     """
     Зчитує внутрішню матрицю камери K з файлу calib.txt (формат KITTI).
 
@@ -227,7 +227,7 @@ def run_odometry_pipeline(
     feature_matcher,
     estimator: MotionEstimator,
     max_frames: Optional[int] = None,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray]:
     """
     Повний прохід по датасету: видобуток ознак → оцінка руху → траєкторія.
 
