@@ -5,7 +5,9 @@ Essential Matrix → Pose Recovery (R, t) з масштабом із Ground Trut
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
+import time
+import os
 
 import cv2
 import numpy as np
@@ -39,6 +41,76 @@ class TrajectoryState:
             self.R_pos = np.eye(3, dtype=np.float64)
         if self.t_pos is None:
             self.t_pos = np.zeros((3, 1), dtype=np.float64)
+
+
+@dataclass
+class PipelineMetrics:
+    """Покадрові метрики роботи VO-пайплайна."""
+    frame_times_sec: np.ndarray
+    fps_per_frame: np.ndarray
+    pose_success: np.ndarray
+    inliers_per_frame: np.ndarray
+
+
+@dataclass
+class ExperimentResult:
+    """Підсумок експерименту для конкретного детектора."""
+    detector_name: str
+    estimated_traj: np.ndarray
+    gt_traj: np.ndarray
+    metrics: PipelineMetrics
+    avg_fps: float
+    ate_rmse: float
+    pose_success_rate: float
+    turn_success_rate: float
+    straight_success_rate: float
+
+
+def compute_ate_rmse(
+    estimated_traj: np.ndarray,
+    gt_traj: np.ndarray,
+    start_idx: int = 1,
+) -> float:
+    """
+    Absolute Trajectory Error (ATE) у формі RMSE.
+    """
+    est = estimated_traj[start_idx:]
+    gt = gt_traj[start_idx:]
+
+    if est.size == 0 or gt.size == 0:
+        return float("nan")
+
+    errors = np.linalg.norm(est - gt, axis=1)
+    return float(np.sqrt(np.mean(errors ** 2)))
+
+
+def detect_turn_frames(
+    gt_traj: np.ndarray,
+    heading_threshold_deg: float = 1.5,
+) -> np.ndarray:
+    """
+    Позначає кадри, де траєкторія має поворот (за зміною heading у площині XZ).
+    """
+    n = len(gt_traj)
+    turn_mask = np.zeros(n, dtype=bool)
+    if n < 3:
+        return turn_mask
+
+    dx = np.diff(gt_traj[:, 0])
+    dz = np.diff(gt_traj[:, 2])
+    heading = np.unwrap(np.arctan2(dz, dx))
+    d_heading = np.diff(heading)
+    threshold = np.deg2rad(heading_threshold_deg)
+
+    # d_heading[i] відповідає кадру i+2 у вихідній послідовності
+    turn_mask[2:] = np.abs(d_heading) > threshold
+    return turn_mask
+
+
+def _safe_rate(mask: np.ndarray, success: np.ndarray) -> float:
+    if mask.sum() == 0:
+        return float("nan")
+    return float(np.mean(success[mask]))
 
 def load_camera_matrix(calib_path: Union[str, Path], camera_id: int = 0) -> np.ndarray:
     """
@@ -227,7 +299,7 @@ def run_odometry_pipeline(
     feature_matcher,
     estimator: MotionEstimator,
     max_frames: Optional[int] = None,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, PipelineMetrics]:
     """
     Повний прохід по датасету: видобуток ознак → оцінка руху → траєкторія.
 
@@ -238,12 +310,21 @@ def run_odometry_pipeline(
     """
     n = len(parser) if max_frames is None else min(max_frames, len(parser))
 
-    estimated_traj = np.zeros((n, 3))
-    gt_traj        = np.zeros((n, 3))
+    estimated_traj = np.zeros((n, 3), dtype=np.float64)
+    gt_traj        = np.zeros((n, 3), dtype=np.float64)
+    frame_times_sec = np.zeros(n, dtype=np.float64)
+    fps_per_frame = np.zeros(n, dtype=np.float64)
+    pose_success = np.zeros(n, dtype=bool)
+    inliers_per_frame = np.zeros(n, dtype=np.int32)
 
     state = TrajectoryState()
 
+    img0, pose0 = parser[0]
+    _ = img0
+    gt_traj[0] = pose0[:3, 3]
+
     for idx in range(1, n):
+        t_frame_start = time.perf_counter()
         img_prev, pose_prev = parser[idx - 1]
         img_curr, pose_curr = parser[idx]
 
@@ -251,6 +332,8 @@ def run_odometry_pipeline(
         if match_result is None:
             estimated_traj[idx] = estimated_traj[idx - 1]
             gt_traj[idx]        = pose_curr[:3, 3]
+            frame_times_sec[idx] = time.perf_counter() - t_frame_start
+            fps_per_frame[idx] = 1.0 / max(frame_times_sec[idx], 1e-9)
             continue
 
         estimate = estimator.estimate(
@@ -262,9 +345,13 @@ def run_odometry_pipeline(
 
         if estimate is not None:
             state = MotionEstimator.update_trajectory(state, estimate)
+            pose_success[idx] = True
+            inliers_per_frame[idx] = int(estimate.n_inliers)
 
         estimated_traj[idx] = state.t_pos.ravel()
         gt_traj[idx]        = pose_curr[:3, 3]
+        frame_times_sec[idx] = time.perf_counter() - t_frame_start
+        fps_per_frame[idx] = 1.0 / max(frame_times_sec[idx], 1e-9)
 
         if idx % 100 == 0:
             err = np.linalg.norm(estimated_traj[idx] - gt_traj[idx])
@@ -274,13 +361,125 @@ def run_odometry_pipeline(
                 f"err={err:.2f} m"
             )
 
-    return estimated_traj, gt_traj
+    metrics = PipelineMetrics(
+        frame_times_sec=frame_times_sec,
+        fps_per_frame=fps_per_frame,
+        pose_success=pose_success,
+        inliers_per_frame=inliers_per_frame,
+    )
+    return estimated_traj, gt_traj, metrics
+
+
+def run_detector_experiment(
+    parser,
+    estimator: MotionEstimator,
+    detector_type: DetectorType,
+    max_frames: Optional[int] = None,
+    turn_heading_threshold_deg: float = 1.5,
+) -> Optional[ExperimentResult]:
+    """Запускає повний експеримент для одного детектора."""
+    try:
+        matcher = FeatureMatcher(detector_type)
+    except cv2.error as e:
+        logging.warning(f"Детектор {detector_type.name} недоступний: {e}")
+        return None
+
+    logging.info(f"\n=== Експеримент: {detector_type.name} ===")
+    estimated_traj, gt_traj, metrics = run_odometry_pipeline(
+        parser, matcher, estimator, max_frames=max_frames
+    )
+
+    valid = np.arange(len(metrics.fps_per_frame)) > 0
+    avg_fps = float(np.mean(metrics.fps_per_frame[valid]))
+    ate_rmse = compute_ate_rmse(estimated_traj, gt_traj, start_idx=1)
+    pose_success_rate = float(np.mean(metrics.pose_success[valid]))
+
+    turn_mask = detect_turn_frames(gt_traj, heading_threshold_deg=turn_heading_threshold_deg)
+    turn_success_rate = _safe_rate(turn_mask & valid, metrics.pose_success)
+    straight_success_rate = _safe_rate((~turn_mask) & valid, metrics.pose_success)
+
+    return ExperimentResult(
+        detector_name=detector_type.name,
+        estimated_traj=estimated_traj,
+        gt_traj=gt_traj,
+        metrics=metrics,
+        avg_fps=avg_fps,
+        ate_rmse=ate_rmse,
+        pose_success_rate=pose_success_rate,
+        turn_success_rate=turn_success_rate,
+        straight_success_rate=straight_success_rate,
+    )
+
+
+def plot_fps_histogram(results: List[ExperimentResult]):
+    """Гістограма середнього FPS для детекторів."""
+    names = [r.detector_name for r in results]
+    fps_values = [r.avg_fps for r in results]
+
+    fig = plt.figure(figsize=(8, 5))
+    bars = plt.bar(names, fps_values, color=["#2a9d8f", "#e9c46a", "#e76f51"])
+    for bar, fps in zip(bars, fps_values):
+        plt.text(
+            bar.get_x() + bar.get_width() / 2.0,
+            bar.get_height(),
+            f"{fps:.1f}",
+            ha="center",
+            va="bottom",
+        )
+    plt.title("Average FPS by Detector")
+    plt.ylabel("FPS")
+    plt.grid(axis="y", alpha=0.3)
+    return fig
+
+
+def plot_trajectories(results: List[ExperimentResult]):
+    """Порівняння траєкторій GT та оцінених траєкторій для всіх детекторів."""
+    fig = plt.figure(figsize=(10, 7))
+    gt = results[0].gt_traj
+    plt.plot(gt[:, 0], gt[:, 2], label="Ground Truth", color="black", linewidth=2.0)
+
+    colors = {
+        "SIFT": "#1d3557",
+        "SURF": "#457b9d",
+        "ORB": "#e63946",
+    }
+    for res in results:
+        plt.plot(
+            res.estimated_traj[:, 0],
+            res.estimated_traj[:, 2],
+            label=f"{res.detector_name} (ATE={res.ate_rmse:.2f}m)",
+            linestyle="--",
+            color=colors.get(res.detector_name, None),
+        )
+
+    plt.title("Ground Truth vs Estimated Trajectories")
+    plt.xlabel("X Position (meters)")
+    plt.ylabel("Z Position (meters)")
+    plt.legend()
+    plt.grid(True)
+    return fig
 
 if __name__ == "__main__":
     parser_args = argparse.ArgumentParser(description="Motion Estimation with KITTI Dataset")
     parser_args.add_argument(
         "--max_frames", type=int, default=None,
         help="Максимальна кількість кадрів для обробки (None для всіх кадрів)"
+    )
+    parser_args.add_argument(
+        "--detectors", nargs="+", default=["SIFT", "SURF", "ORB"],
+        help="Список детекторів для тесту: SIFT SURF ORB"
+    )
+    parser_args.add_argument(
+        "--turn_heading_threshold_deg", type=float, default=1.5,
+        help="Поріг зміни heading (градуси) для визначення поворотів"
+    )
+    parser_args.add_argument(
+        "--no_plot", action="store_true",
+        help="Не показувати графіки"
+    )
+    parser_args.add_argument(
+        "--save_plots_dir", type=str, default=None,
+        help="Папка для збереження графіків (PNG)"
     )
     args = parser_args.parse_args()
 
@@ -297,42 +496,55 @@ if __name__ == "__main__":
     logging.info(K)
 
     estimator = MotionEstimator(K)
-    matcher = FeatureMatcher(DetectorType.SIFT)
-
-    state = TrajectoryState()
-
     max_frames = args.max_frames if args.max_frames is not None else len(parser)
 
-    for idx in range(1, max_frames):
-        img_prev, pose_prev = parser[idx - 1]
-        img_curr, pose_curr = parser[idx]
-
-        match_result = matcher.match(img_prev, img_curr)
-        if match_result is None:
-            logging.warning(f"[{idx:04d}] Недостатньо збігів")
+    selected_detectors: List[DetectorType] = []
+    for name in args.detectors:
+        key = name.upper()
+        if key not in DetectorType.__members__:
+            logging.warning(f"Невідомий детектор '{name}', пропускаю")
             continue
+        selected_detectors.append(DetectorType[key])
 
-        estimate = estimator.estimate(
-            match_result.pts_prev,
-            match_result.pts_curr,
-            pose_prev,
-            pose_curr,
+    if not selected_detectors:
+        raise ValueError("Не обрано жодного валідного детектора")
+
+    results: List[ExperimentResult] = []
+    for detector in selected_detectors:
+        result = run_detector_experiment(
+            parser=parser,
+            estimator=estimator,
+            detector_type=detector,
+            max_frames=max_frames,
+            turn_heading_threshold_deg=args.turn_heading_threshold_deg,
+        )
+        if result is not None:
+            results.append(result)
+
+    if not results:
+        raise RuntimeError("Не вдалося виконати жоден експеримент")
+
+    logging.info("\n===== ПІДСУМКОВІ МЕТРИКИ =====")
+    for r in results:
+        logging.info(
+            f"{r.detector_name:>4s} | FPS(avg)={r.avg_fps:8.2f} | "
+            f"ATE(RMSE)={r.ate_rmse:8.3f} m | "
+            f"success={100.0*r.pose_success_rate:6.2f}% | "
+            f"turn_success={100.0*r.turn_success_rate if not np.isnan(r.turn_success_rate) else float('nan'):6.2f}% | "
+            f"straight_success={100.0*r.straight_success_rate if not np.isnan(r.straight_success_rate) else float('nan'):6.2f}%"
         )
 
-        if estimate is not None:
-            state = MotionEstimator.update_trajectory(state, estimate)
+    fps_fig = plot_fps_histogram(results)
+    traj_fig = plot_trajectories(results)
 
-        x, z = state.t_pos[0, 0], state.t_pos[2, 0]
-        logging.info(f"[{idx:04d}] Позиція: x={x:.2f}, z={z:.2f}")
+    if args.save_plots_dir:
+        os.makedirs(args.save_plots_dir, exist_ok=True)
+        fps_path = os.path.join(args.save_plots_dir, "fps_histogram.png")
+        traj_path = os.path.join(args.save_plots_dir, "trajectories_comparison.png")
+        fps_fig.savefig(fps_path, dpi=150, bbox_inches="tight")
+        traj_fig.savefig(traj_path, dpi=150, bbox_inches="tight")
+        logging.info(f"Збережено графік FPS: {fps_path}")
+        logging.info(f"Збережено графік траєкторій: {traj_path}")
 
-    estimated_traj, gt_traj = run_odometry_pipeline(parser, matcher, estimator, max_frames=max_frames)
-
-    plt.figure(figsize=(10, 6))
-    plt.plot(gt_traj[:, 0], gt_traj[:, 2], label="Ground Truth", color="green")
-    plt.plot(estimated_traj[:, 0], estimated_traj[:, 2], label="Estimated", color="blue", linestyle="--")
-    plt.title("Ground Truth vs Estimated Trajectory")
-    plt.xlabel("X Position (meters)")
-    plt.ylabel("Z Position (meters)")
-    plt.legend()
-    plt.grid(True)
-    plt.show()
+    if not args.no_plot:
+        plt.show()
