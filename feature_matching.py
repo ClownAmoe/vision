@@ -17,6 +17,7 @@ class DetectorType(Enum):
     SIFT = auto()
     SURF = auto()
     ORB  = auto()
+    OPTICAL_FLOW = auto()
 
 
 @dataclass
@@ -78,9 +79,29 @@ class FeatureMatcher:
         orb_n_features: int = 3000,
         surf_hessian_threshold: float = 400.0,
         sift_n_features: int = 0,
+        flow_max_corners: int = 3000,
+        flow_quality_level: float = 0.01,
+        flow_min_distance: float = 7.0,
+        flow_block_size: int = 7,
+        lk_win_size: Tuple[int, int] = (21, 21),
+        lk_max_level: int = 3,
+        lk_criteria: Tuple[int, int, float] = (
+            cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+            30,
+            0.01,
+        ),
     ):
         self.detector_type   = detector_type
         self.ratio_threshold = ratio_threshold
+
+        self.flow_max_corners = int(flow_max_corners)
+        self.flow_quality_level = float(flow_quality_level)
+        self.flow_min_distance = float(flow_min_distance)
+        self.flow_block_size = int(flow_block_size)
+        self.lk_win_size = tuple(lk_win_size)
+        self.lk_max_level = int(lk_max_level)
+        self.lk_criteria = lk_criteria
+
         self.detector        = self._init_detector(
             detector_type, orb_n_features, surf_hessian_threshold, sift_n_features
         )
@@ -99,6 +120,8 @@ class FeatureMatcher:
             return cv2.xfeatures2d.SURF_create(hessianThreshold=surf_thresh)
         elif det_type == DetectorType.ORB:
             return cv2.ORB_create(nfeatures=orb_n)
+        elif det_type == DetectorType.OPTICAL_FLOW:
+            return None
         else:
             raise ValueError(f"Невідомий тип детектора: {det_type}")
 
@@ -106,8 +129,21 @@ class FeatureMatcher:
     def _init_matcher(det_type: DetectorType):
         if det_type in (DetectorType.SIFT, DetectorType.SURF):
             return _build_flann_matcher(det_type)
-        else:
+        elif det_type == DetectorType.ORB:
             return _build_bf_matcher()
+        else:
+            return None
+
+    @staticmethod
+    def _build_match_visualization_payload(
+        pts_prev: np.ndarray,
+        pts_curr: np.ndarray,
+    ) -> Tuple[list, list, list]:
+        """Перетворює пари точок на KeyPoint/DMatch для drawMatches."""
+        kp_prev = [cv2.KeyPoint(float(p[0]), float(p[1]), 1) for p in pts_prev]
+        kp_curr = [cv2.KeyPoint(float(p[0]), float(p[1]), 1) for p in pts_curr]
+        good_matches = [cv2.DMatch(i, i, 0.0) for i in range(len(pts_prev))]
+        return kp_prev, kp_curr, good_matches
 
     def match(
         self,
@@ -133,6 +169,52 @@ class FeatureMatcher:
 
         gray_prev = self._to_gray(img_prev)
         gray_curr = self._to_gray(img_curr)
+
+        if self.detector_type == DetectorType.OPTICAL_FLOW:
+            pts_prev = cv2.goodFeaturesToTrack(
+                gray_prev,
+                maxCorners=self.flow_max_corners,
+                qualityLevel=self.flow_quality_level,
+                minDistance=self.flow_min_distance,
+                blockSize=self.flow_block_size,
+            )
+            if pts_prev is None or len(pts_prev) < min_matches:
+                return None
+
+            pts_curr, status, _ = cv2.calcOpticalFlowPyrLK(
+                gray_prev,
+                gray_curr,
+                pts_prev,
+                None,
+                winSize=self.lk_win_size,
+                maxLevel=self.lk_max_level,
+                criteria=self.lk_criteria,
+            )
+            if pts_curr is None or status is None:
+                return None
+
+            valid = status.ravel() == 1
+            pts_prev_valid = pts_prev.reshape(-1, 2)[valid]
+            pts_curr_valid = pts_curr.reshape(-1, 2)[valid]
+
+            if len(pts_prev_valid) < min_matches:
+                return None
+
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            kp_prev, kp_curr, good_matches = self._build_match_visualization_payload(
+                pts_prev_valid,
+                pts_curr_valid,
+            )
+
+            return MatchResult(
+                pts_prev=pts_prev_valid.astype(np.float32),
+                pts_curr=pts_curr_valid.astype(np.float32),
+                kp_prev=kp_prev,
+                kp_curr=kp_curr,
+                good_matches=good_matches,
+                elapsed_ms=elapsed_ms,
+                detector_name=self.detector_type.name,
+            )
 
         kp_prev, des_prev = self.detector.detectAndCompute(gray_prev, None)
         kp_curr, des_curr = self.detector.detectAndCompute(gray_curr, None)
@@ -228,9 +310,9 @@ if __name__ == "__main__":
     parser = KITTIOdometryParser(DATASET_PATH, sequence=SEQUENCE, camera=CAMERA)
     print(parser.summary())
 
-    matcher = FeatureMatcher(DetectorType.SIFT)
+    matcher = FeatureMatcher(DetectorType.OPTICAL_FLOW)
 
-    for idx in range(100):
+    for idx in range(len(parser) - 1):
         img_prev, pose_prev = parser[idx]
         img_curr, pose_curr = parser[idx + 1]
 

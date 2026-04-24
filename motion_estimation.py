@@ -417,7 +417,14 @@ def plot_fps_histogram(results: List[ExperimentResult]):
     fps_values = [r.avg_fps for r in results]
 
     fig = plt.figure(figsize=(8, 5))
-    bars = plt.bar(names, fps_values, color=["#2a9d8f", "#e9c46a", "#e76f51"])
+    color_map = {
+        "SIFT": "#2a9d8f",
+        "SURF": "#e9c46a",
+        "ORB": "#e76f51",
+        "OPTICAL_FLOW": "#264653",
+    }
+    colors = [color_map.get(name, "#6c757d") for name in names]
+    bars = plt.bar(names, fps_values, color=colors)
     for bar, fps in zip(bars, fps_values):
         plt.text(
             bar.get_x() + bar.get_width() / 2.0,
@@ -442,6 +449,7 @@ def plot_trajectories(results: List[ExperimentResult]):
         "SIFT": "#1d3557",
         "SURF": "#457b9d",
         "ORB": "#e63946",
+        "OPTICAL_FLOW": "#2a9d8f",
     }
     for res in results:
         plt.plot(
@@ -466,8 +474,8 @@ if __name__ == "__main__":
         help="Максимальна кількість кадрів для обробки (None для всіх кадрів)"
     )
     parser_args.add_argument(
-        "--detectors", nargs="+", default=["SIFT", "SURF", "ORB"],
-        help="Список детекторів для тесту: SIFT SURF ORB"
+        "--detectors", nargs="+", default=["SIFT", "SURF", "ORB", "OPTICAL_FLOW"],
+        help="Список детекторів для тесту: SIFT SURF ORB OPTICAL_FLOW"
     )
     parser_args.add_argument(
         "--turn_heading_threshold_deg", type=float, default=1.5,
