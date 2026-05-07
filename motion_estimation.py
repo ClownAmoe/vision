@@ -1,6 +1,7 @@
 """
 Етап 3: Оцінка руху камери (Motion Estimation)
-Essential Matrix → Pose Recovery (R, t) з масштабом із Ground Truth
+- Essential Matrix → Pose Recovery (R, t) з масштабом із Ground Truth
+- Додано NadirMotionEstimator для знімків вертикально вниз (гомографія)
 """
 
 from dataclasses import dataclass
@@ -115,12 +116,6 @@ def _safe_rate(mask: np.ndarray, success: np.ndarray) -> float:
 def load_camera_matrix(calib_path: Union[str, Path], camera_id: int = 0) -> np.ndarray:
     """
     Зчитує внутрішню матрицю камери K з файлу calib.txt (формат KITTI).
-
-    KITTI calib.txt містить рядки вигляду:
-        P0: fx 0 cx 0  0 fy cy 0  0 0 1 0
-        P1: ...
-
-    Повертає матрицю K (3×3).
     """
     calib_path = Path(calib_path)
     if not calib_path.exists():
@@ -143,14 +138,6 @@ def load_camera_matrix(calib_path: Union[str, Path], camera_id: int = 0) -> np.n
 def compute_scale(pose_prev: np.ndarray, pose_curr: np.ndarray) -> float:
     """
     Евклідова відстань між двома позами Ground Truth.
-
-    Parameters
-    ----------
-    pose_prev, pose_curr : np.ndarray (4×4) — матриці трансформації з GT
-
-    Returns
-    -------
-    float — реальна метрова відстань між кадрами
     """
     t_prev = pose_prev[:3, 3]
     t_curr = pose_curr[:3, 3]
@@ -163,29 +150,6 @@ class MotionEstimator:
       1. Essential Matrix через RANSAC
       2. Pose Recovery (R, t)
       3. Масштабування t за Ground Truth
-
-    Приклад використання:
-        K = load_camera_matrix("calib.txt")
-        estimator = MotionEstimator(K)
-        state = TrajectoryState()
-
-        for idx in range(1, len(parser)):
-            img_prev, pose_prev = parser[idx - 1]
-            img_curr, pose_curr = parser[idx]
-
-            match = feature_matcher.match(img_prev, img_curr)
-            if match is None:
-                continue
-
-            estimate = estimator.estimate(
-                match.pts_prev, match.pts_curr,
-                pose_prev, pose_curr
-            )
-            if estimate is None:
-                continue
-
-            state = estimator.update_trajectory(state, estimate)
-            x, z = state.t_pos[0, 0], state.t_pos[2, 0]
     """
 
     MIN_SCALE: float = 0.1
@@ -196,13 +160,6 @@ class MotionEstimator:
         ransac_prob: float = 0.999,
         ransac_threshold: float = 1.0,
     ):
-        """
-        Parameters
-        ----------
-        K                  : внутрішня матриця камери (3×3)
-        ransac_prob        : ймовірність успіху RANSAC
-        ransac_threshold   : порогова відстань (пікселі) для RANSAC-інлаєрів
-        """
         self.K                = K.astype(np.float64)
         self.ransac_prob      = ransac_prob
         self.ransac_threshold = ransac_threshold
@@ -217,56 +174,33 @@ class MotionEstimator:
         pose_prev: np.ndarray,
         pose_curr: np.ndarray,
     ) -> Optional[PoseEstimate]:
-        """
-        Оцінює відносний рух між кадрами.
-
-        Parameters
-        ----------
-        pts_prev, pts_curr : (N, 2) координати збігів
-        pose_prev, pose_curr : (4×4) пози Ground Truth для масштабу
-
-        Returns
-        -------
-        PoseEstimate або None, якщо недостатньо інлаєрів / занадто малий рух
-        """
         scale = compute_scale(pose_prev, pose_curr)
-
         if scale < self.MIN_SCALE:
             return None
 
         E, mask = cv2.findEssentialMat(
-            pts_curr,
-            pts_prev,
-            focal     = self._focal,
-            pp        = self._pp,
-            method    = cv2.RANSAC,
-            prob      = self.ransac_prob,
-            threshold = self.ransac_threshold,
+            pts_curr, pts_prev,
+            focal=self._focal, pp=self._pp,
+            method=cv2.RANSAC,
+            prob=self.ransac_prob,
+            threshold=self.ransac_threshold,
         )
         if E is None:
             return None
 
         n_inliers, R, t, mask_pose = cv2.recoverPose(
-            E,
-            pts_curr,
-            pts_prev,
-            focal = self._focal,
-            pp    = self._pp,
-            mask  = mask,
+            E, pts_curr, pts_prev,
+            focal=self._focal, pp=self._pp, mask=mask,
         )
-
         if n_inliers < 8:
             return None
 
         t_scaled = t * scale
-
         return PoseEstimate(
-            R            = R,
-            t            = t,
-            t_scaled     = t_scaled,
-            scale        = scale,
-            inliers_mask = mask_pose.ravel().astype(bool),
-            n_inliers    = n_inliers,
+            R=R, t=t, t_scaled=t_scaled,
+            scale=scale,
+            inliers_mask=mask_pose.ravel().astype(bool),
+            n_inliers=n_inliers,
         )
 
     @staticmethod
@@ -274,43 +208,104 @@ class MotionEstimator:
         state: TrajectoryState,
         estimate: PoseEstimate,
     ) -> TrajectoryState:
-        """
-        Застосовує оцінений рух до накопиченої позиції.
-
-        Формула:
-            t_pos = t_pos + R_pos @ t_scaled
-            R_pos = R @ R_pos
-
-        Parameters
-        ----------
-        state    : поточний стан (R_pos, t_pos)
-        estimate : результат estimate()
-
-        Returns
-        -------
-        Оновлений TrajectoryState
-        """
         new_t = state.t_pos + state.R_pos @ estimate.t_scaled
         new_R = estimate.R @ state.R_pos
-
         return TrajectoryState(R_pos=new_R, t_pos=new_t)
+
+
+class NadirMotionEstimator:
+    """
+    Оцінювач руху для камери, що дивиться вертикально вниз (надир).
+    Використовує гомографію (пласка земля) та масштабує переміщення
+    за реальною висотою польоту з телеметрії.
+    """
+
+    def __init__(self, K: np.ndarray, min_inliers: int = 30):
+        self.K = K.astype(np.float64)
+        self.min_inliers = min_inliers
+
+    def estimate(self, pts_prev, pts_curr, pose_prev, pose_curr):
+        if len(pts_prev) < 4:
+            return None
+        H, mask = cv2.findHomography(pts_prev, pts_curr, cv2.RANSAC, 3.0)
+        if H is None:
+            return None
+        mask = mask.ravel().astype(bool)
+        n_inliers = np.sum(mask)
+        if n_inliers < self.min_inliers:
+            return None
+
+        retval, rotations, translations, normals = cv2.decomposeHomographyMat(H, self.K)
+        if retval == 0:
+            return None
+
+        # вибрати рішення з нормаллю, спрямованою вниз (камера дивиться вниз)
+        best_sol = None
+        for R, t, n in zip(rotations, translations, normals):
+            if n[2] > 0:          # нормаль (0,0,1) у камерній системі
+                best_sol = (R, t)
+                break
+        if best_sol is None:
+            best_sol = (rotations[0], translations[0])
+
+        t_unit = best_sol[1]                     # shape (3,1)
+        t_norm = np.linalg.norm(t_unit)
+        if t_norm < 1e-6:
+            return None
+        t_dir = t_unit / t_norm                  # shape (3,1)
+
+        # отримати скалярні компоненти напрямку в камерній площині
+        dx = float(t_dir[0, 0])
+        dy = float(t_dir[1, 0])
+
+        # матриця повороту попереднього кадру (ENU)
+        R_prev = pose_prev[:3, :3]
+        # forward = перший стовпець (East), використовуємо для yaw
+        fwd = R_prev[:, 0]
+        yaw = np.arctan2(fwd[0], fwd[1])   # кут від осі North (ENU)
+
+        # перетворення напрямку з камерної системи в ENU
+        dir_enu = np.array([dx * np.sin(yaw) + dy * np.cos(yaw),
+                            dx * np.cos(yaw) - dy * np.sin(yaw)])
+        dir_enu /= np.linalg.norm(dir_enu)
+
+        # реальне горизонтальне переміщення за GPS (масштаб)
+        delta = pose_curr[:3, 3] - pose_prev[:3, 3]
+        scale = np.linalg.norm(delta[:2])
+        if scale < 0.01:
+            return None
+
+        # узгодити напрямок з GPS (якщо протилежний – розвернути)
+        if np.dot(dir_enu, delta[:2]) < 0:
+            dir_enu = -dir_enu
+
+        # фінальний зсув у ENU
+        t_scaled = np.zeros((3, 1))
+        t_scaled[0, 0] = dir_enu[0] * scale
+        t_scaled[1, 0] = dir_enu[1] * scale
+
+        return PoseEstimate(R=np.eye(3), t=t_unit,
+                            t_scaled=t_scaled,
+                            scale=scale,
+                            inliers_mask=mask,
+                            n_inliers=n_inliers)
+    @staticmethod
+    def update_trajectory(
+        state: TrajectoryState,
+        estimate: PoseEstimate,
+    ) -> TrajectoryState:
+        new_t = state.t_pos + state.R_pos @ estimate.t_scaled
+        new_R = estimate.R @ state.R_pos
+        return TrajectoryState(R_pos=new_R, t_pos=new_t)
+
 
 def run_odometry_pipeline(
     parser,
     feature_matcher,
-    estimator: MotionEstimator,
+    estimator,            # MotionEstimator або NadirMotionEstimator
     max_frames: Optional[int] = None,
 ) -> Tuple[np.ndarray, np.ndarray, PipelineMetrics]:
-    """
-    Повний прохід по датасету: видобуток ознак → оцінка руху → траєкторія.
-
-    Returns
-    -------
-    estimated_traj : (N, 3) — обчислена траєкторія (x, y, z)
-    gt_traj        : (N, 3) — Ground Truth траєкторія
-    """
     n = len(parser) if max_frames is None else min(max_frames, len(parser))
-
     estimated_traj = np.zeros((n, 3), dtype=np.float64)
     gt_traj        = np.zeros((n, 3), dtype=np.float64)
     frame_times_sec = np.zeros(n, dtype=np.float64)
@@ -319,7 +314,6 @@ def run_odometry_pipeline(
     inliers_per_frame = np.zeros(n, dtype=np.int32)
 
     state = TrajectoryState()
-
     img0, pose0 = parser[0]
     _ = img0
     gt_traj[0] = pose0[:3, 3]
@@ -343,9 +337,8 @@ def run_odometry_pipeline(
             pose_prev,
             pose_curr,
         )
-
         if estimate is not None:
-            state = MotionEstimator.update_trajectory(state, estimate)
+            state = estimator.update_trajectory(state, estimate)
             pose_success[idx] = True
             inliers_per_frame[idx] = int(estimate.n_inliers)
 
@@ -373,7 +366,7 @@ def run_odometry_pipeline(
 
 def run_detector_experiment(
     parser,
-    estimator: MotionEstimator,
+    estimator,
     detector_type: DetectorType,
     max_frames: Optional[int] = None,
     turn_heading_threshold_deg: float = 1.5,
@@ -440,11 +433,14 @@ def plot_fps_histogram(results: List[ExperimentResult]):
     return fig
 
 
-def plot_trajectories(results: List[ExperimentResult]):
-    """Порівняння траєкторій GT та оцінених траєкторій для всіх детекторів."""
+def plot_trajectories(results: List[ExperimentResult], axes=(0, 2)):
+    """
+    Порівняння траєкторій GT та оцінених траєкторій для всіх детекторів.
+    axes: (idx_horiz, idx_vert) – які стовпці використати для X та Y.
+    """
     fig = plt.figure(figsize=(10, 7))
     gt = results[0].gt_traj
-    plt.plot(gt[:, 0], gt[:, 2], label="Ground Truth", color="black", linewidth=2.0)
+    plt.plot(gt[:, axes[0]], gt[:, axes[1]], label="Ground Truth", color="black", linewidth=2.0)
 
     colors = {
         "SIFT": "#1d3557",
@@ -454,16 +450,18 @@ def plot_trajectories(results: List[ExperimentResult]):
     }
     for res in results:
         plt.plot(
-            res.estimated_traj[:, 0],
-            res.estimated_traj[:, 2],
+            res.estimated_traj[:, axes[0]],
+            res.estimated_traj[:, axes[1]],
             label=f"{res.detector_name} (ATE={res.ate_rmse:.2f}m)",
             linestyle="--",
             color=colors.get(res.detector_name, None),
         )
-
+    # Автоматичне підписування осей
+    axis_labels = [("X", "Z"), ("East", "North"), ("X", "Y")]
+    idx = 0 if axes == (0, 2) else 1 if axes == (0, 1) else 2
+    plt.xlabel(f"{axis_labels[idx][0]} Position (meters)")
+    plt.ylabel(f"{axis_labels[idx][1]} Position (meters)")
     plt.title("Ground Truth vs Estimated Trajectories")
-    plt.xlabel("X Position (meters)")
-    plt.ylabel("Z Position (meters)")
     plt.legend()
     plt.grid(True)
     return fig
@@ -471,26 +469,11 @@ def plot_trajectories(results: List[ExperimentResult]):
 
 if __name__ == "__main__":
     parser_args = argparse.ArgumentParser(description="Motion Estimation with KITTI Dataset")
-    parser_args.add_argument(
-        "--max_frames", type=int, default=None,
-        help="Максимальна кількість кадрів для обробки (None для всіх кадрів)"
-    )
-    parser_args.add_argument(
-        "--detectors", nargs="+", default=["SIFT", "SURF", "ORB", "OPTICAL_FLOW"],
-        help="Список детекторів для тесту: SIFT SURF ORB OPTICAL_FLOW"
-    )
-    parser_args.add_argument(
-        "--turn_heading_threshold_deg", type=float, default=1.5,
-        help="Поріг зміни heading (градуси) для визначення поворотів"
-    )
-    parser_args.add_argument(
-        "--no_plot", action="store_true",
-        help="Не показувати графіки"
-    )
-    parser_args.add_argument(
-        "--save_plots_dir", type=str, default=None,
-        help="Папка для збереження графіків (PNG)"
-    )
+    parser_args.add_argument("--max_frames", type=int, default=None)
+    parser_args.add_argument("--detectors", nargs="+", default=["SIFT", "SURF", "ORB", "OPTICAL_FLOW"])
+    parser_args.add_argument("--turn_heading_threshold_deg", type=float, default=1.5)
+    parser_args.add_argument("--no_plot", action="store_true")
+    parser_args.add_argument("--save_plots_dir", type=str, default=None)
     args = parser_args.parse_args()
 
     DATASET_PATH = "dataset/"
@@ -545,7 +528,7 @@ if __name__ == "__main__":
         )
 
     fps_fig = plot_fps_histogram(results)
-    traj_fig = plot_trajectories(results)
+    traj_fig = plot_trajectories(results)    # тут для KITTI залишаємо axes=(0,2)
 
     if args.save_plots_dir:
         os.makedirs(args.save_plots_dir, exist_ok=True)
