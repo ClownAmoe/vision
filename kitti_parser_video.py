@@ -16,12 +16,17 @@ class TelemetrySample:
     yaw_deg: float
     pitch_deg: float
     roll_deg: float
+    h_speed_mps: float
+    x_speed_mps: float
+    y_speed_mps: float
+    z_speed_mps: float
 
 
 class VideoTelemetryParser:
     """Video + telemetry parser with time-based interpolation."""
 
     FT_TO_M = 0.3048
+    MPH_TO_MPS = 0.44704
 
     def __init__(
         self,
@@ -108,6 +113,10 @@ class VideoTelemetryParser:
         yaw = []
         pitch = []
         roll = []
+        h_speed = []
+        x_speed = []
+        y_speed = []
+        z_speed = []
 
         for row in self._rows:
             t = row.get(self.time_column)
@@ -127,6 +136,10 @@ class VideoTelemetryParser:
             yaw_val = row.get("OSD.yaw") if row.get("OSD.yaw") is not None else row.get("OSD.yaw [360]")
             pitch_val = row.get("OSD.pitch")
             roll_val = row.get("OSD.roll")
+            h_speed_mph = row.get("OSD.hSpeed [MPH]")
+            x_speed_mph = row.get("OSD.xSpeed [MPH]")
+            y_speed_mph = row.get("OSD.ySpeed [MPH]")
+            z_speed_mph = row.get("OSD.zSpeed [MPH]")
 
             if lat_val is None or lon_val is None or alt_ft is None:
                 continue
@@ -138,6 +151,10 @@ class VideoTelemetryParser:
             yaw.append(float(yaw_val) if yaw_val is not None else float("nan"))
             pitch.append(float(pitch_val) if pitch_val is not None else float("nan"))
             roll.append(float(roll_val) if roll_val is not None else float("nan"))
+            h_speed.append(float(h_speed_mph) * self.MPH_TO_MPS if h_speed_mph is not None else float("nan"))
+            x_speed.append(float(x_speed_mph) * self.MPH_TO_MPS if x_speed_mph is not None else float("nan"))
+            y_speed.append(float(y_speed_mph) * self.MPH_TO_MPS if y_speed_mph is not None else float("nan"))
+            z_speed.append(float(z_speed_mph) * self.MPH_TO_MPS if z_speed_mph is not None else float("nan"))
 
         if len(times) < 2:
             raise ValueError("Not enough telemetry rows with valid time/position data.")
@@ -153,6 +170,10 @@ class VideoTelemetryParser:
         self._yaw_series = np.array(yaw, dtype=np.float64)
         self._pitch_series = np.array(pitch, dtype=np.float64)
         self._roll_series = np.array(roll, dtype=np.float64)
+        self._h_speed_series = np.array(h_speed, dtype=np.float64)
+        self._x_speed_series = np.array(x_speed, dtype=np.float64)
+        self._y_speed_series = np.array(y_speed, dtype=np.float64)
+        self._z_speed_series = np.array(z_speed, dtype=np.float64)
 
     @staticmethod
     def _first_non_null(row: dict, keys: List[str]) -> Optional[float]:
@@ -176,6 +197,15 @@ class VideoTelemetryParser:
         t_clamped = float(np.clip(t, times[0], times[-1]))
         return float(np.interp(t_clamped, times, values))
 
+    def _interp_optional(self, t: float, times: np.ndarray, values: np.ndarray) -> float:
+        mask = np.isfinite(values)
+        if mask.sum() < 2:
+            return float("nan")
+        times_valid = times[mask]
+        vals_valid = values[mask]
+        t_clamped = float(np.clip(t, times_valid[0], times_valid[-1]))
+        return float(np.interp(t_clamped, times_valid, vals_valid))
+
     def _interp_angle_deg(self, t: float, times: np.ndarray, values_deg: np.ndarray) -> float:
         mask = np.isfinite(values_deg)
         if mask.sum() < 2:
@@ -195,6 +225,10 @@ class VideoTelemetryParser:
         yaw = self._interp_angle_deg(t, self._tele_times, self._yaw_series)
         pitch = self._interp_angle_deg(t, self._tele_times, self._pitch_series)
         roll = self._interp_angle_deg(t, self._tele_times, self._roll_series)
+        h_speed = self._interp_optional(t, self._tele_times, self._h_speed_series)
+        x_speed = self._interp_optional(t, self._tele_times, self._x_speed_series)
+        y_speed = self._interp_optional(t, self._tele_times, self._y_speed_series)
+        z_speed = self._interp_optional(t, self._tele_times, self._z_speed_series)
 
         return TelemetrySample(
             time_s=t,
@@ -204,6 +238,10 @@ class VideoTelemetryParser:
             yaw_deg=yaw,
             pitch_deg=pitch,
             roll_deg=roll,
+            h_speed_mps=h_speed,
+            x_speed_mps=x_speed,
+            y_speed_mps=y_speed,
+            z_speed_mps=z_speed,
         )
 
     def __getitem__(self, idx: int) -> Tuple[np.ndarray, TelemetrySample]:

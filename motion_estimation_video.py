@@ -188,6 +188,7 @@ class MotionEstimator:
         self.ransac_prob = ransac_prob
         self.ransac_threshold = ransac_threshold
         self.scale_mode = scale_mode
+        self._warned_speed = False
 
         self._focal = float(K[0, 0])
         self._pp = (float(K[0, 2]), float(K[1, 2]))
@@ -198,12 +199,24 @@ class MotionEstimator:
         pts_curr: np.ndarray,
         pose_prev: np.ndarray,
         pose_curr: np.ndarray,
+        tele_prev: Optional[TelemetrySample] = None,
+        tele_curr: Optional[TelemetrySample] = None,
     ) -> Tuple[Optional[PoseEstimate], str]:
         delta = pose_curr[:3, 3] - pose_prev[:3, 3]
-        if self.scale_mode == "xy":
-            scale = float(np.linalg.norm(delta[[0, 2]]))
-        else:
-            scale = float(np.linalg.norm(delta))
+        scale = None
+
+        if self.scale_mode == "speed":
+            scale = self._speed_scale(tele_prev, tele_curr)
+            if scale is None:
+                if not self._warned_speed:
+                    logging.warning("Speed-based scale unavailable; falling back to XY delta.")
+                    self._warned_speed = True
+
+        if scale is None:
+            if self.scale_mode == "3d":
+                scale = float(np.linalg.norm(delta))
+            else:
+                scale = float(np.linalg.norm(delta[[0, 2]]))
         if scale < self.min_scale:
             return None, "scale"
 
@@ -247,9 +260,36 @@ class MotionEstimator:
         pts_curr: np.ndarray,
         pose_prev: np.ndarray,
         pose_curr: np.ndarray,
+        tele_prev: Optional[TelemetrySample] = None,
+        tele_curr: Optional[TelemetrySample] = None,
     ) -> Optional[PoseEstimate]:
-        estimate, _ = self.estimate_with_reason(pts_prev, pts_curr, pose_prev, pose_curr)
+        estimate, _ = self.estimate_with_reason(
+            pts_prev, pts_curr, pose_prev, pose_curr, tele_prev, tele_curr
+        )
         return estimate
+
+    def _speed_scale(
+        self,
+        tele_prev: Optional[TelemetrySample],
+        tele_curr: Optional[TelemetrySample],
+    ) -> Optional[float]:
+        if tele_prev is None or tele_curr is None:
+            return None
+        dt = float(tele_curr.time_s - tele_prev.time_s)
+        if dt <= 0:
+            return None
+
+        speed = tele_curr.h_speed_mps
+        if not np.isfinite(speed):
+            if np.isfinite(tele_curr.x_speed_mps) and np.isfinite(tele_curr.y_speed_mps):
+                speed = float(np.hypot(tele_curr.x_speed_mps, tele_curr.y_speed_mps))
+            elif np.isfinite(tele_prev.h_speed_mps):
+                speed = float(tele_prev.h_speed_mps)
+
+        if not np.isfinite(speed):
+            return None
+
+        return max(speed, 0.0) * dt
 
     @staticmethod
     def update_trajectory(state: TrajectoryState, estimate: PoseEstimate) -> TrajectoryState:
@@ -264,8 +304,12 @@ def run_odometry_pipeline(
     estimator: MotionEstimator,
     max_frames: Optional[int] = None,
     min_matches: int = 8,
+    frame_stride: int = 1,
 ) -> Tuple[np.ndarray, np.ndarray, PipelineMetrics]:
-    n = len(parser) if max_frames is None else min(max_frames, len(parser))
+    n_total = len(parser) if max_frames is None else min(max_frames, len(parser))
+    stride = max(1, int(frame_stride))
+    indices = list(range(0, n_total, stride))
+    n = len(indices)
 
     estimated_traj = np.zeros((n, 3), dtype=np.float64)
     gt_traj = np.zeros((n, 3), dtype=np.float64)
@@ -282,15 +326,17 @@ def run_odometry_pipeline(
     fail_essential = 0
     fail_inliers = 0
 
-    img0, tele0 = parser[0]
+    img0, tele0 = parser[indices[0]]
     pose0 = telemetry_builder.sample_to_pose(tele0)
     _ = img0
     gt_traj[0] = pose0[:3, 3]
 
-    for idx in range(1, n):
+    for k in range(1, n):
+        idx_prev = indices[k - 1]
+        idx_curr = indices[k]
         t_frame_start = time.perf_counter()
-        img_prev, tele_prev = parser[idx - 1]
-        img_curr, tele_curr = parser[idx]
+        img_prev, tele_prev = parser[idx_prev]
+        img_curr, tele_curr = parser[idx_curr]
 
         pose_prev = telemetry_builder.sample_to_pose(tele_prev)
         pose_curr = telemetry_builder.sample_to_pose(tele_curr)
@@ -298,10 +344,10 @@ def run_odometry_pipeline(
         match_result = feature_matcher.match(img_prev, img_curr, min_matches=min_matches)
         if match_result is None:
             fail_no_matches += 1
-            estimated_traj[idx] = estimated_traj[idx - 1]
-            gt_traj[idx] = pose_curr[:3, 3]
-            frame_times_sec[idx] = time.perf_counter() - t_frame_start
-            fps_per_frame[idx] = 1.0 / max(frame_times_sec[idx], 1e-9)
+            estimated_traj[k] = estimated_traj[k - 1]
+            gt_traj[k] = pose_curr[:3, 3]
+            frame_times_sec[k] = time.perf_counter() - t_frame_start
+            fps_per_frame[k] = 1.0 / max(frame_times_sec[k], 1e-9)
             continue
 
         estimate, reason = estimator.estimate_with_reason(
@@ -309,6 +355,8 @@ def run_odometry_pipeline(
             match_result.pts_curr,
             pose_prev,
             pose_curr,
+            tele_prev,
+            tele_curr,
         )
 
         if estimate is None:
@@ -321,18 +369,18 @@ def run_odometry_pipeline(
 
         if estimate is not None:
             state = MotionEstimator.update_trajectory(state, estimate)
-            pose_success[idx] = True
-            inliers_per_frame[idx] = int(estimate.n_inliers)
+            pose_success[k] = True
+            inliers_per_frame[k] = int(estimate.n_inliers)
 
-        estimated_traj[idx] = state.t_pos.ravel()
-        gt_traj[idx] = pose_curr[:3, 3]
-        frame_times_sec[idx] = time.perf_counter() - t_frame_start
-        fps_per_frame[idx] = 1.0 / max(frame_times_sec[idx], 1e-9)
+        estimated_traj[k] = state.t_pos.ravel()
+        gt_traj[k] = pose_curr[:3, 3]
+        frame_times_sec[k] = time.perf_counter() - t_frame_start
+        fps_per_frame[k] = 1.0 / max(frame_times_sec[k], 1e-9)
 
-        if idx % 100 == 0:
-            err = np.linalg.norm(estimated_traj[idx] - gt_traj[idx])
+        if k % 100 == 0:
+            err = np.linalg.norm(estimated_traj[k] - gt_traj[k])
             print(
-                f"[{idx:04d}/{n}]  "
+                f"[{idx_curr:04d}/{n_total}]  "
                 f"pos=({state.t_pos[0,0]:7.1f}, {state.t_pos[2,0]:7.1f})  "
                 f"err={err:.2f} m"
             )
@@ -362,6 +410,7 @@ def run_detector_experiment(
     align_ate: bool = False,
     min_matches: int = 8,
     flow_params: Optional[dict] = None,
+    frame_stride: int = 1,
 ) -> Optional[ExperimentResult]:
     try:
         matcher_kwargs = flow_params or {}
@@ -372,7 +421,12 @@ def run_detector_experiment(
 
     logging.info(f"\n=== Experiment: {detector_type.name} ===")
     estimated_traj, gt_traj, metrics = run_odometry_pipeline(
-        parser, matcher, estimator, max_frames=max_frames, min_matches=min_matches
+        parser,
+        matcher,
+        estimator,
+        max_frames=max_frames,
+        min_matches=min_matches,
+        frame_stride=frame_stride,
     )
 
     if align_ate:
@@ -552,9 +606,9 @@ if __name__ == "__main__":
     )
     parser_args.add_argument(
         "--scale_mode",
-        choices=["xy", "3d"],
+        choices=["xy", "3d", "speed"],
         default="xy",
-        help="Scale mode: xy for horizontal-only, 3d for full 3D",
+        help="Scale mode: xy for horizontal-only, 3d for full 3D, speed for telemetry speed",
     )
     parser_args.add_argument(
         "--min_matches", type=int, default=8,
