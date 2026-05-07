@@ -1,6 +1,4 @@
-"""
-Stage 2: Feature extraction and matching for video frames.
-"""
+"""Feature matching for drone video frames."""
 
 import time
 from dataclasses import dataclass
@@ -10,43 +8,29 @@ from typing import Optional, Tuple
 import cv2
 import numpy as np
 
-from kitti_parser_video import VideoTelemetryParser
-
+from drone_parser import DroneVideoDataset
 
 class DetectorType(Enum):
-    SIFT = auto()
-    SURF = auto()
     ORB = auto()
     OPTICAL_FLOW = auto()
 
 
 @dataclass
 class MatchResult:
-    """Match result between two frames."""
     pts_prev: np.ndarray
     pts_curr: np.ndarray
     kp_prev: list
     kp_curr: list
     good_matches: list
-    elapsed_ms: float = 0.0
-    detector_name: str = ""
-
-
-def _build_flann_matcher(detector: DetectorType) -> cv2.FlannBasedMatcher:
-    """FLANN for SIFT/SURF float descriptors."""
-    FLANN_INDEX_KDTREE = 1
-    index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
-    search_params = dict(checks=50)
-    return cv2.FlannBasedMatcher(index_params, search_params)
+    elapsed_ms: float
+    detector_name: str
 
 
 def _build_bf_matcher() -> cv2.BFMatcher:
-    """Brute-Force for ORB binary descriptors."""
     return cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
 
 
-def _lowe_ratio_test(matches: list, ratio_threshold: float = 0.75) -> list:
-    """Lowe ratio test to filter ambiguous matches."""
+def _lowe_ratio_test(matches: list, ratio_threshold: float) -> list:
     good = []
     for m, n in matches:
         if m.distance < ratio_threshold * n.distance:
@@ -55,7 +39,6 @@ def _lowe_ratio_test(matches: list, ratio_threshold: float = 0.75) -> list:
 
 
 def _matched_points(kp_prev: list, kp_curr: list, good_matches: list) -> Tuple[np.ndarray, np.ndarray]:
-    """Convert DMatch list into point arrays."""
     pts_prev = np.float32([kp_prev[m.queryIdx].pt for m in good_matches])
     pts_curr = np.float32([kp_curr[m.trainIdx].pt for m in good_matches])
     return pts_prev, pts_curr
@@ -66,14 +49,12 @@ class FeatureMatcher:
         self,
         detector_type: DetectorType = DetectorType.ORB,
         ratio_threshold: float = 0.75,
-        orb_n_features: int = 3000,
-        surf_hessian_threshold: float = 400.0,
-        sift_n_features: int = 0,
-        flow_max_corners: int = 3000,
+        orb_n_features: int = 2000,
+        flow_max_corners: int = 2000,
         flow_quality_level: float = 0.01,
         flow_min_distance: float = 7.0,
         flow_block_size: int = 7,
-        flow_fb_max_error: float = 1.5,
+        flow_fb_max_error: float = 2.0,
         lk_win_size: Tuple[int, int] = (21, 21),
         lk_max_level: int = 3,
         lk_criteria: Tuple[int, int, float] = (
@@ -94,46 +75,18 @@ class FeatureMatcher:
         self.lk_max_level = int(lk_max_level)
         self.lk_criteria = lk_criteria
 
-        self.detector = self._init_detector(
-            detector_type, orb_n_features, surf_hessian_threshold, sift_n_features
-        )
-        self.matcher = self._init_matcher(detector_type)
-
-    @staticmethod
-    def _init_detector(det_type: DetectorType, orb_n: int, surf_thresh: float, sift_n: int):
-        if det_type == DetectorType.SIFT:
-            return cv2.xfeatures2d.SIFT_create(nfeatures=sift_n)
-        if det_type == DetectorType.SURF:
-            return cv2.xfeatures2d.SURF_create(hessianThreshold=surf_thresh)
-        if det_type == DetectorType.ORB:
-            return cv2.ORB_create(nfeatures=orb_n)
-        if det_type == DetectorType.OPTICAL_FLOW:
-            return None
-        raise ValueError(f"Unknown detector type: {det_type}")
-
-    @staticmethod
-    def _init_matcher(det_type: DetectorType):
-        if det_type in (DetectorType.SIFT, DetectorType.SURF):
-            return _build_flann_matcher(det_type)
-        if det_type == DetectorType.ORB:
-            return _build_bf_matcher()
-        return None
-
-    @staticmethod
-    def _build_match_visualization_payload(
-        pts_prev: np.ndarray,
-        pts_curr: np.ndarray,
-    ) -> Tuple[list, list, list]:
-        kp_prev = [cv2.KeyPoint(float(p[0]), float(p[1]), 1) for p in pts_prev]
-        kp_curr = [cv2.KeyPoint(float(p[0]), float(p[1]), 1) for p in pts_curr]
-        good_matches = [cv2.DMatch(i, i, 0.0) for i in range(len(pts_prev))]
-        return kp_prev, kp_curr, good_matches
+        if detector_type == DetectorType.ORB:
+            self.detector = cv2.ORB_create(nfeatures=orb_n_features)
+            self.matcher = _build_bf_matcher()
+        else:
+            self.detector = None
+            self.matcher = None
 
     def match(
         self,
         img_prev: np.ndarray,
         img_curr: np.ndarray,
-        min_matches: int = 8,
+        min_matches: int = 12,
     ) -> Optional[MatchResult]:
         t0 = time.perf_counter()
 
@@ -175,10 +128,10 @@ class FeatureMatcher:
             if pts_back is None or status_back is None:
                 return None
 
-            valid = (status.ravel() == 1) & (status_back.ravel() == 1)
             pts_prev_xy = pts_prev.reshape(-1, 2)
             pts_back_xy = pts_back.reshape(-1, 2)
             fb_err = np.linalg.norm(pts_prev_xy - pts_back_xy, axis=1)
+            valid = (status.ravel() == 1) & (status_back.ravel() == 1)
             valid &= fb_err <= self.flow_fb_max_error
 
             pts_prev_valid = pts_prev_xy[valid]
@@ -188,9 +141,8 @@ class FeatureMatcher:
                 return None
 
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
-            kp_prev, kp_curr, good_matches = self._build_match_visualization_payload(
-                pts_prev_valid,
-                pts_curr_valid,
+            kp_prev, kp_curr, good_matches = self._build_visualization_payload(
+                pts_prev_valid, pts_curr_valid
             )
 
             return MatchResult(
@@ -211,16 +163,14 @@ class FeatureMatcher:
         if len(kp_prev) < min_matches or len(kp_curr) < min_matches:
             return None
 
-        des_prev, des_curr = self._ensure_float(des_prev, des_curr)
         raw_matches = self.matcher.knnMatch(des_prev, des_curr, k=2)
-
         good_matches = _lowe_ratio_test(raw_matches, self.ratio_threshold)
-        elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
         if len(good_matches) < min_matches:
             return None
 
         pts_prev, pts_curr = _matched_points(kp_prev, kp_curr, good_matches)
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
         return MatchResult(
             pts_prev=pts_prev,
@@ -238,14 +188,15 @@ class FeatureMatcher:
             return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         return img
 
-    def _ensure_float(
-        self,
-        des_prev: np.ndarray,
-        des_curr: np.ndarray,
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        if self.detector_type in (DetectorType.SIFT, DetectorType.SURF):
-            return des_prev.astype(np.float32), des_curr.astype(np.float32)
-        return des_prev, des_curr
+    @staticmethod
+    def _build_visualization_payload(
+        pts_prev: np.ndarray,
+        pts_curr: np.ndarray,
+    ) -> Tuple[list, list, list]:
+        kp_prev = [cv2.KeyPoint(float(p[0]), float(p[1]), 1) for p in pts_prev]
+        kp_curr = [cv2.KeyPoint(float(p[0]), float(p[1]), 1) for p in pts_curr]
+        good_matches = [cv2.DMatch(i, i, 0.0) for i in range(len(pts_prev))]
+        return kp_prev, kp_curr, good_matches
 
     def draw_matches(
         self,
@@ -264,54 +215,49 @@ class FeatureMatcher:
             flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS,
         )
         label = (
-            f"{result.detector_name} | "
-            f"matches: {len(result.good_matches)} | "
+            f"{result.detector_name} | matches: {len(result.good_matches)} | "
             f"{result.elapsed_ms:.1f} ms"
         )
-        cv2.putText(vis, label, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(
+            vis,
+            label,
+            (10, 25),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 0),
+            2,
+        )
         return vis
 
 
 if __name__ == "__main__":
-    np.random.seed(42)
-    dummy = (np.random.rand(480, 640) * 255).astype(np.uint8)
-
-    for det in DetectorType:
-        try:
-            matcher = FeatureMatcher(det)
-            result = matcher.match(dummy, dummy)
-            if result:
-                print(f"{det.name:4s}: {len(result.good_matches):4d} matches | {result.elapsed_ms:.1f} ms")
-            else:
-                print(f"{det.name:4s}: not enough matches")
-        except cv2.error as e:
-            print(f"{det.name:4s}: unavailable ({e})")
-
-    DATASET_PATH = "dataset/"
+    DATASET_PATH = "dataset"
     VIDEO_PATH = "drone_footage/23-02-01_FR_F01_V01.MP4"
     CSV_PATH = "drone_footage/23-02-01_FR_F01.csv"
 
-    parser = VideoTelemetryParser(
+    dataset = DroneVideoDataset(
         DATASET_PATH,
         video_path=VIDEO_PATH,
         csv_path=CSV_PATH,
-        time_column="OSD.flyTime [s]",
-        time_offset=0.0,
-        normalize_time=True,
+        target_fps=5.0,
+        frame_stride=None,
     )
-    print(parser.summary())
+    print(dataset.summary())
 
     matcher = FeatureMatcher(DetectorType.OPTICAL_FLOW)
 
-    for idx in range(len(parser) - 1):
-        img_prev, _ = parser[idx]
-        img_curr, _ = parser[idx + 1]
+    for idx in range(len(dataset) - 1):
+        img_prev, _ = dataset[idx]
+        img_curr, _ = dataset[idx + 1]
 
         result = matcher.match(img_prev, img_curr)
         if result:
-            print(f"[{idx:04d}] {len(result.good_matches)} matches | {result.elapsed_ms:.1f} ms")
+            print(
+                f"[{idx:04d}] matches={len(result.good_matches)} "
+                f"time={result.elapsed_ms:.1f} ms"
+            )
             vis = matcher.draw_matches(img_prev, img_curr, result, max_draw=80)
-            cv2.imshow("Feature Matches", vis)
+            cv2.imshow("Drone Feature Matches", vis)
         else:
             print(f"[{idx:04d}] not enough matches")
 
@@ -320,4 +266,4 @@ if __name__ == "__main__":
             break
 
     cv2.destroyAllWindows()
-    parser.close()
+    dataset.close()
