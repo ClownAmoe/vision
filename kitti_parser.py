@@ -1,8 +1,7 @@
-import os
 import numpy as np
 import cv2
 from pathlib import Path
-from typing import Iterator, Tuple, Optional, List
+from typing import Iterator, Tuple, List
 
 
 class KITTIOdometryParser:
@@ -98,6 +97,7 @@ class KITTIOdometryParser:
             f"  Images dir: {self.images_dir}\n"
             f"  Poses file: {self.poses_file}\n"
         )
+
 
 if __name__ == "__main__":
     DATASET_PATH = "dataset/"

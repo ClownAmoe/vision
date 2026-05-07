@@ -5,7 +5,7 @@ Essential Matrix → Pose Recovery (R, t) з масштабом із Ground Trut
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 import time
 import os
 
@@ -155,6 +155,7 @@ def compute_scale(pose_prev: np.ndarray, pose_curr: np.ndarray) -> float:
     t_prev = pose_prev[:3, 3]
     t_curr = pose_curr[:3, 3]
     return float(np.linalg.norm(t_curr - t_prev))
+
 
 class MotionEstimator:
     """
@@ -466,6 +467,7 @@ def plot_trajectories(results: List[ExperimentResult]):
     plt.legend()
     plt.grid(True)
     return fig
+
 
 if __name__ == "__main__":
     parser_args = argparse.ArgumentParser(description="Motion Estimation with KITTI Dataset")
