@@ -76,9 +76,24 @@ class DroneVideoCSVParser:
 
         lat0 = self.df['OSD.latitude'].iloc[0]
         lon0 = self.df['OSD.longitude'].iloc[0]
-        # Використовуємо абсолютну висоту OSD.height [m] (якщо є) або altitude
-        alt_col = 'OSD.height [m]' if 'OSD.height [m]' in self.df.columns else 'OSD.altitude [m]'
-        alt0 = self.df[alt_col].iloc[0]
+        
+        # Визначаємо колону висоти: спочатку [m], потім [ft]
+        alt_col = None
+        if 'OSD.height [m]' in self.df.columns:
+            alt_col = 'OSD.height [m]'
+        elif 'OSD.height [ft]' in self.df.columns:
+            # Якщо тільки [ft], конвертуємо
+            self.df['OSD.height [m]'] = self.df['OSD.height [ft]'].astype(float) * 0.3048
+            alt_col = 'OSD.height [m]'
+        elif 'OSD.altitude [m]' in self.df.columns:
+            alt_col = 'OSD.altitude [m]'
+        elif 'OSD.altitude [ft]' in self.df.columns:
+            self.df['OSD.altitude [m]'] = self.df['OSD.altitude [ft]'].astype(float) * 0.3048
+            alt_col = 'OSD.altitude [m]'
+        else:
+            raise ValueError("Не вдалося знайти колону висоти у CSV!")
+        
+        alt0 = float(self.df[alt_col].iloc[0])
 
         self._origin_ecef = np.array(self._transformer.transform(lon0, lat0, alt0))
         self._R_ecef2enu = self._ecef2enu_matrix(lat0, lon0)
@@ -93,7 +108,7 @@ class DroneVideoCSVParser:
             times[i] = (row['timestamp'] - t0).total_seconds()
             lat = float(row['OSD.latitude'])
             lon = float(row['OSD.longitude'])
-            alt = float(row[alt_col]) if alt_col in row else 0.0
+            alt = float(row[alt_col])
 
             ecef_pt = np.array(self._transformer.transform(lon, lat, alt))
             enu = self._R_ecef2enu @ (ecef_pt - self._origin_ecef)
@@ -106,6 +121,7 @@ class DroneVideoCSVParser:
         self.csv_times = times
         self.pos_csv = positions
         self.euler_csv = self._unwrap_yaw(euler)
+        self._altitude_col = alt_col  # зберігаємо для подальшого використання
 
     @staticmethod
     def _ecef2enu_matrix(lat_deg, lon_deg):
