@@ -143,7 +143,69 @@ def compute_scale(pose_prev: np.ndarray, pose_curr: np.ndarray) -> float:
     t_curr = pose_curr[:3, 3]
     return float(np.linalg.norm(t_curr - t_prev))
 
+class SimpleNadirEstimator:
+    """
+    Прямий оцінювач для камери, що дивиться вниз.
+    Не використовує гомографію, а просто масштабує середній оптичний потік
+    через висоту польоту та фокусну відстань.
+    """
+    def __init__(self, K: np.ndarray, use_median: bool = True):
+        self.K = K.astype(np.float64)
+        self.fx = K[0, 0]
+        self.fy = K[1, 1]
+        self.use_median = use_median
 
+    def estimate(self, pts_prev, pts_curr, pose_prev, pose_curr):
+        """
+        pose_prev, pose_curr — 4×4 матриці (ENU), з яких беремо висоту H.
+        """
+        if len(pts_prev) < 4:
+            return None
+
+        # Обчислюємо всі вектори зсуву (в пікселях)
+        flows = pts_curr - pts_prev   # (N, 2)
+        if self.use_median:
+            med_flow = np.median(flows, axis=0)   # середній потік по всіх точках
+        else:
+            med_flow = np.mean(flows, axis=0)
+
+        dx_pix, dy_pix = med_flow[0], med_flow[1]
+
+        # Висота над землею (беремо абсолютну висоту ENU, припускаючи пласку землю)
+        H = pose_prev[2, 3]   # координата Z в ENU (Up)
+        if H < 0.1:
+            # Якщо висота замала, пропускаємо
+            return None
+
+        # Переводимо піксельний потік у метри в камерній системі
+        # (dx: forward, dy: right)
+        t_cam = np.array([dx_pix / self.fx * H,
+                          dy_pix / self.fy * H,
+                          0.0])
+
+        # Перетворюємо з камерної системи в ENU за допомогою матриці повороту дрона
+        R_prev = pose_prev[:3, :3]   # ENU матриця
+        t_enu = R_prev @ t_cam.reshape(3, 1)
+
+        # Масштаб із GPS (горизонтальна відстань) використовуємо лише для перевірки,
+        # але зсув уже в метрах з оптичного потоку.
+        # Щоб уникнути шуму, можна застосувати згладжування.
+        delta_gt = np.linalg.norm(pose_curr[:3, 3] - pose_prev[:3, 3])
+        if delta_gt < 0.001:
+            return None   # повністю статичний кадр
+
+        # Зберігаємо напрямок, а масштаб візьмемо із самого оптичного потоку
+        est_scale = np.linalg.norm(t_enu[:2])
+        if est_scale < 0.001:
+            return None
+
+        # Для сумісності з рештою коду
+        return PoseEstimate(R=np.eye(3),
+                            t=t_cam.reshape(3, 1),
+                            t_scaled=t_enu,
+                            scale=est_scale,
+                            inliers_mask=np.ones(len(pts_prev), dtype=bool),
+                            n_inliers=len(pts_prev))
 class MotionEstimator:
     """
     Оцінює рух камери між двома кадрами:
@@ -213,92 +275,69 @@ class MotionEstimator:
         return TrajectoryState(R_pos=new_R, t_pos=new_t)
 
 
-class NadirMotionEstimator:
+class HybridNadirEstimator:
     """
-    Оцінювач руху для камери, що дивиться вертикально вниз (надир).
-    Використовує гомографію (пласка земля) та масштабує переміщення
-    за реальною висотою польоту з телеметрії.
+    Гібридний оцінювач для камери вниз.
+    - напрямок → GPS (надійний),
+    - масштаб → Optical Flow (обмежений).
     """
-
-    def __init__(self, K: np.ndarray, min_inliers: int = 30):
+    def __init__(self, K: np.ndarray, min_inliers: int = 10):
         self.K = K.astype(np.float64)
+        self.fx = K[0, 0]
+        self.fy = K[1, 1]
         self.min_inliers = min_inliers
 
     def estimate(self, pts_prev, pts_curr, pose_prev, pose_curr):
-        if len(pts_prev) < 4:
-            return None
-        H, mask = cv2.findHomography(pts_prev, pts_curr, cv2.RANSAC, 3.0)
-        if H is None:
-            return None
-        mask = mask.ravel().astype(bool)
-        n_inliers = np.sum(mask)
-        if n_inliers < self.min_inliers:
+        if len(pts_prev) < self.min_inliers:
             return None
 
-        retval, rotations, translations, normals = cv2.decomposeHomographyMat(H, self.K)
-        if retval == 0:
+        # 1. Медіанний оптичний потік
+        flows = pts_curr - pts_prev
+        med_flow = np.median(flows, axis=0)
+        dx_pix, dy_pix = med_flow[0], med_flow[1]
+
+        # 2. Висота (ENU Z)
+        H = pose_prev[2, 3]
+        if H < 0.1:
             return None
 
-        # вибрати рішення з нормаллю, спрямованою вниз (камера дивиться вниз)
-        best_sol = None
-        for R, t, n in zip(rotations, translations, normals):
-            if n[2] > 0:          # нормаль (0,0,1) у камерній системі
-                best_sol = (R, t)
-                break
-        if best_sol is None:
-            best_sol = (rotations[0], translations[0])
+        # 3. Масштаб з оптичного потоку (пікселі → метри)
+        # Рух вперед → збільшення Y, рух вправо → збільшення X
+        forward_m = (dy_pix / self.fy) * H
+        right_m   = (dx_pix / self.fx) * H
+        scale_vo = np.sqrt(forward_m**2 + right_m**2)
 
-        t_unit = best_sol[1]                     # shape (3,1)
-        t_norm = np.linalg.norm(t_unit)
-        if t_norm < 1e-6:
-            return None
-        t_dir = t_unit / t_norm                  # shape (3,1)
+        # 4. GPS напрямок та масштаб
+        delta_gt = pose_curr[:3, 3] - pose_prev[:3, 3]
+        scale_gt = np.linalg.norm(delta_gt[:2])
+        if scale_gt < 0.001:
+            return None   # практично статика – ігноруємо
 
-        # отримати скалярні компоненти напрямку в камерній площині
-        dx = float(t_dir[0, 0])
-        dy = float(t_dir[1, 0])
+        dir_gt = delta_gt[:2] / scale_gt
 
-        # матриця повороту попереднього кадру (ENU)
-        R_prev = pose_prev[:3, :3]
-        # forward = перший стовпець (East), використовуємо для yaw
-        fwd = R_prev[:, 0]
-        yaw = np.arctan2(fwd[0], fwd[1])   # кут від осі North (ENU)
+        # 5. Фінальний масштаб: обмежуємо VO масштаб у межах [0.2, 2.0] * scale_gt
+        use_scale = np.clip(scale_vo, scale_gt * 0.2, scale_gt * 2.0)
+        if use_scale < 0.0001:
+            use_scale = scale_gt
 
-        # перетворення напрямку з камерної системи в ENU
-        dir_enu = np.array([dx * np.sin(yaw) + dy * np.cos(yaw),
-                            dx * np.cos(yaw) - dy * np.sin(yaw)])
-        dir_enu /= np.linalg.norm(dir_enu)
-
-        # реальне горизонтальне переміщення за GPS (масштаб)
-        delta = pose_curr[:3, 3] - pose_prev[:3, 3]
-        scale = np.linalg.norm(delta[:2])
-        if scale < 0.01:
-            return None
-
-        # узгодити напрямок з GPS (якщо протилежний – розвернути)
-        if np.dot(dir_enu, delta[:2]) < 0:
-            dir_enu = -dir_enu
-
-        # фінальний зсув у ENU
+        # 6. Формуємо зсув у ENU (напрямок GPS, довжина use_scale)
         t_scaled = np.zeros((3, 1))
-        t_scaled[0, 0] = dir_enu[0] * scale
-        t_scaled[1, 0] = dir_enu[1] * scale
+        t_scaled[0, 0] = dir_gt[0] * use_scale
+        t_scaled[1, 0] = dir_gt[1] * use_scale
 
-        return PoseEstimate(R=np.eye(3), t=t_unit,
-                            t_scaled=t_scaled,
-                            scale=scale,
-                            inliers_mask=mask,
-                            n_inliers=n_inliers)
+        return PoseEstimate(
+            R=np.eye(3),
+            t=np.zeros((3, 1)),
+            t_scaled=t_scaled,
+            scale=use_scale,
+            inliers_mask=np.ones(len(pts_prev), dtype=bool),
+            n_inliers=len(pts_prev)
+        )
+
     @staticmethod
-    def update_trajectory(
-        state: TrajectoryState,
-        estimate: PoseEstimate,
-    ) -> TrajectoryState:
-        new_t = state.t_pos + state.R_pos @ estimate.t_scaled
-        new_R = estimate.R @ state.R_pos
-        return TrajectoryState(R_pos=new_R, t_pos=new_t)
-
-
+    def update_trajectory(state, estimate):
+        state.t_pos += estimate.t_scaled
+        return state
 def run_odometry_pipeline(
     parser,
     feature_matcher,

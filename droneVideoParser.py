@@ -128,18 +128,22 @@ class DroneVideoCSVParser:
 
     @staticmethod
     def euler_to_rot_matrix(yaw_deg, pitch_deg, roll_deg) -> np.ndarray:
-        yaw   = np.deg2rad(yaw_deg)
+        """
+        Правильна матриця повороту з DJI-кутів у ENU.
+        yaw=0 → північ, yaw зростає за годинниковою.
+        """
+        yaw_rad = np.pi/2 - np.deg2rad(yaw_deg)   # перетворення в стандартний кут
         pitch = np.deg2rad(pitch_deg)
-        roll  = np.deg2rad(roll_deg)
-        cy, sy = np.cos(yaw), np.sin(yaw)
+        roll = np.deg2rad(roll_deg)
+        cy, sy = np.cos(yaw_rad), np.sin(yaw_rad)
         cp, sp = np.cos(pitch), np.sin(pitch)
         cr, sr = np.cos(roll), np.sin(roll)
         return np.array([
-            [cy*cp,  cy*sp*sr - sy*cr,  cy*sp*cr + sy*sr],
-            [sy*cp,  sy*sp*sr + cy*cr,  sy*sp*cr - cy*sr],
-            [-sp,    cp*sr,             cp*cr]
+            [ cy*cp,  cy*sp*sr - sy*cr,  cy*sp*cr + sy*sr],
+            [ sy*cp,  sy*sp*sr + cy*cr,  sy*sp*cr - cy*sr],
+            [ -sp,    cp*sr,             cp*cr]
         ])
-
+    
     def _interpolate_pose(self, frame_time: float) -> np.ndarray:
         if frame_time <= self.csv_times[0]:
             t = self.pos_csv[0], self.euler_csv[0]

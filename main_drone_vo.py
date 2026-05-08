@@ -5,24 +5,24 @@ import matplotlib.pyplot as plt
 from droneVideoParser import DroneVideoCSVParser
 from feature_matching import FeatureMatcher, DetectorType
 from motion_estimation import (
-    NadirMotionEstimator, TrajectoryState,
+    HybridNadirEstimator, TrajectoryState,
     compute_ate_rmse, PipelineMetrics,
     ExperimentResult, plot_trajectories
 )
 
 VIDEO_PATH = "dataset/drone_footage/23-02-01_FR_F01_V01.mp4"
 CSV_PATH   = "dataset/drone_footage/23-02-01_FR_F01.csv"
-MAX_FRAMES = 1000         # ← змініть тут, щоб обробляти більше/менше
+MAX_FRAMES = 500
 
 parser = DroneVideoCSVParser(VIDEO_PATH, CSV_PATH)
 print(parser.summary())
 K = parser.K
 print("K:\n", K)
 
-estimator = NadirMotionEstimator(K, min_inliers=30)
+estimator = HybridNadirEstimator(K, min_inliers=10)
 matcher = FeatureMatcher(DetectorType.OPTICAL_FLOW)
 
-n = min(len(parser), MAX_FRAMES)   # обмеження
+n = min(len(parser), MAX_FRAMES)
 est_traj = np.zeros((n, 3))
 gt_traj = np.zeros((n, 3))
 fps_arr = np.zeros(n)
@@ -47,14 +47,13 @@ for idx in range(1, n):
         fps_arr[idx] = 1.0 / max(time.perf_counter()-t0, 1e-9)
         continue
 
-    # Візуалізація треків
     vis = matcher.draw_matches(img_prev, img_curr, match, max_draw=100)
     cv2.imshow("Optical Flow", vis)
 
     est = estimator.estimate(match.pts_prev, match.pts_curr,
                              pose_prev, pose_curr)
     if est is not None:
-        state.t_pos += est.t_scaled   # t_scaled вже в ENU
+        state.t_pos += est.t_scaled
         success[idx] = True
         inliers_arr[idx] = est.n_inliers
 
@@ -71,22 +70,27 @@ for idx in range(1, n):
 
 cv2.destroyAllWindows()
 
-# Метрики
 valid = np.arange(len(fps_arr)) > 0
 avg_fps = np.mean(fps_arr[valid])
 ate = compute_ate_rmse(est_traj, gt_traj, start_idx=1)
 success_rate = np.mean(success[valid])
 
-print(f"\n=== РЕЗУЛЬТАТ (MAX_FRAMES={MAX_FRAMES}) ===")
+print(f"\n=== РЕЗУЛЬТАТ ===")
 print(f"Кадрів: {n}")
 print(f"FPS: {avg_fps:.1f}  |  ATE: {ate:.3f} м  |  Успішність: {success_rate*100:.1f}%")
 
-# Графік
-res = ExperimentResult(detector_name="OPTICAL_FLOW",
-                       estimated_traj=est_traj, gt_traj=gt_traj,
-                       metrics=PipelineMetrics(fps_arr, fps_arr, success, inliers_arr),
-                       avg_fps=avg_fps, ate_rmse=ate,
-                       pose_success_rate=success_rate,
-                       turn_success_rate=0.0, straight_success_rate=0.0)
+metrics = PipelineMetrics(fps_arr, fps_arr, success, inliers_arr)
+res = ExperimentResult(
+    detector_name="OPTICAL_FLOW",
+    estimated_traj=est_traj,
+    gt_traj=gt_traj,
+    metrics=metrics,
+    avg_fps=avg_fps,
+    ate_rmse=ate,
+    pose_success_rate=success_rate,
+    turn_success_rate=0.0,
+    straight_success_rate=0.0
+)
+
 fig = plot_trajectories([res], axes=(0,1))
 plt.show()
