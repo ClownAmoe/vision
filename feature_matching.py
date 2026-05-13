@@ -4,6 +4,7 @@ Feature Extraction & Matching — SIFT / SURF / ORB
 """
 
 import time
+import argparse
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Optional, Tuple
@@ -12,6 +13,7 @@ import cv2
 import numpy as np
 import os
 from kitti_parser import KITTIOdometryParser
+from droneVideoParser import DroneVideoCSVParser
 
 class DetectorType(Enum):
     SIFT = auto()
@@ -287,6 +289,23 @@ class FeatureMatcher:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         return vis
 
+
+def build_demo_parser(args):
+    if args.dataset_type == "drone":
+        if not args.drone_video_path or not args.drone_csv_path:
+            raise ValueError("Для drone-режиму потрібні --drone_video_path і --drone_csv_path")
+        return DroneVideoCSVParser(
+            video_path=args.drone_video_path,
+            csv_path=args.drone_csv_path,
+            start_frame=args.start_frame,
+            time_window_sec=args.time_window_sec,
+            video_time_offset_sec=args.video_time_offset_sec,
+            use_gimbal_orientation=not args.no_gimbal_orientation,
+            fixed_down_pitch_deg=args.fixed_down_pitch_deg,
+        )
+
+    return KITTIOdometryParser(args.dataset_path, sequence=args.sequence, camera=args.camera)
+
 if __name__ == "__main__":
     np.random.seed(42)
     dummy = (np.random.rand(480, 640) * 255).astype(np.uint8)
@@ -303,16 +322,28 @@ if __name__ == "__main__":
         except cv2.error as e:
             print(f"{det.name:4s}: недоступний ({e})")
 
-    DATASET_PATH = "dataset/"
-    SEQUENCE = "00"
-    CAMERA = "image_0"
+    parser_args = argparse.ArgumentParser(description="Feature matching demo for KITTI or drone footage")
+    parser_args.add_argument("--dataset_type", type=str, default="kitti", choices=["kitti", "drone"])
+    parser_args.add_argument("--dataset_path", type=str, default="dataset/")
+    parser_args.add_argument("--sequence", type=str, default="00")
+    parser_args.add_argument("--camera", type=str, default="image_0")
+    parser_args.add_argument("--drone_video_path", type=str, default=None)
+    parser_args.add_argument("--drone_csv_path", type=str, default=None)
+    parser_args.add_argument("--start_frame", type=int, default=0)
+    parser_args.add_argument("--time_window_sec", type=float, default=5.0)
+    parser_args.add_argument("--video_time_offset_sec", type=float, default=0.0)
+    parser_args.add_argument("--no_gimbal_orientation", action="store_true")
+    parser_args.add_argument("--fixed_down_pitch_deg", type=float, default=-90.0)
+    parser_args.add_argument("--max_frames", type=int, default=None)
+    args = parser_args.parse_args()
 
-    parser = KITTIOdometryParser(DATASET_PATH, sequence=SEQUENCE, camera=CAMERA)
+    parser = build_demo_parser(args)
     print(parser.summary())
 
     matcher = FeatureMatcher(DetectorType.OPTICAL_FLOW)
 
-    for idx in range(len(parser) - 1):
+    limit = len(parser) if args.max_frames is None else min(args.max_frames, len(parser))
+    for idx in range(limit - 1):
         img_prev, pose_prev = parser[idx]
         img_curr, pose_curr = parser[idx + 1]
 

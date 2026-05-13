@@ -12,6 +12,7 @@ import os
 import cv2
 import numpy as np
 from kitti_parser import KITTIOdometryParser
+from droneVideoParser import DroneVideoCSVParser
 from feature_matching import FeatureMatcher, DetectorType
 import matplotlib.pyplot as plt
 import argparse
@@ -70,12 +71,17 @@ def compute_ate_rmse(
     estimated_traj: np.ndarray,
     gt_traj: np.ndarray,
     start_idx: int = 1,
+    axes: Optional[Tuple[int, ...]] = None,
 ) -> float:
     """
     Absolute Trajectory Error (ATE) у формі RMSE.
     """
     est = estimated_traj[start_idx:]
     gt = gt_traj[start_idx:]
+
+    if axes is not None:
+        est = est[:, axes]
+        gt = gt[:, axes]
 
     if est.size == 0 or gt.size == 0:
         return float("nan")
@@ -156,6 +162,39 @@ def compute_scale(pose_prev: np.ndarray, pose_curr: np.ndarray) -> float:
     t_curr = pose_curr[:3, 3]
     return float(np.linalg.norm(t_curr - t_prev))
 
+
+def build_parser(args, dataset_path: str = "dataset/"):
+    """Створює або KITTI, або drone-парсер залежно від CLI-режиму."""
+    if args.dataset_type == "drone":
+        if not args.drone_csv_path:
+            raise ValueError("Для drone-режиму потрібен --drone_csv_path")
+
+        video_paths = getattr(args, "drone_video_paths", None)
+        if video_paths:
+            selected_paths = video_paths
+        elif args.drone_video_path:
+            selected_paths = [args.drone_video_path]
+        else:
+            selected_paths = [
+                str(Path(dataset_path) / "drone_footage" / "23-02-01_FR_F01_V01.MP4"),
+                str(Path(dataset_path) / "drone_footage" / "23-02-01_FR_F01_V02.MP4"),
+                str(Path(dataset_path) / "drone_footage" / "23-02-01_FR_F01_V03.MP4"),
+            ]
+
+        segment_starts = getattr(args, "segment_start_times_sec", None)
+        return DroneVideoCSVParser(
+            video_paths=selected_paths,
+            csv_path=args.drone_csv_path,
+            start_frame=args.start_frame,
+            time_window_sec=args.time_window_sec,
+            video_time_offset_sec=args.video_time_offset_sec,
+            use_gimbal_orientation=not args.no_gimbal_orientation,
+            fixed_down_pitch_deg=args.fixed_down_pitch_deg,
+            segment_start_times_sec=segment_starts,
+        )
+
+    return KITTIOdometryParser(dataset_path, sequence=args.sequence, camera=args.camera)
+
 class MotionEstimator:
     """
     Оцінює рух камери між двома кадрами:
@@ -194,6 +233,7 @@ class MotionEstimator:
         K: np.ndarray,
         ransac_prob: float = 0.999,
         ransac_threshold: float = 1.0,
+        use_ground_truth_scale: bool = True,
     ):
         """
         Parameters
@@ -205,6 +245,7 @@ class MotionEstimator:
         self.K                = K.astype(np.float64)
         self.ransac_prob      = ransac_prob
         self.ransac_threshold = ransac_threshold
+        self.use_ground_truth_scale = bool(use_ground_truth_scale)
 
         self._focal = float(K[0, 0])
         self._pp    = (float(K[0, 2]), float(K[1, 2]))
@@ -228,7 +269,7 @@ class MotionEstimator:
         -------
         PoseEstimate або None, якщо недостатньо інлаєрів / занадто малий рух
         """
-        scale = compute_scale(pose_prev, pose_curr)
+        scale = compute_scale(pose_prev, pose_curr) if self.use_ground_truth_scale else 1.0
 
         if scale < self.MIN_SCALE:
             return None
@@ -318,6 +359,7 @@ def run_odometry_pipeline(
     inliers_per_frame = np.zeros(n, dtype=np.int32)
 
     state = TrajectoryState()
+    segment_ids = getattr(parser, "_sample_segment_ids", None)
 
     img0, pose0 = parser[0]
     _ = img0
@@ -325,6 +367,16 @@ def run_odometry_pipeline(
 
     for idx in range(1, n):
         t_frame_start = time.perf_counter()
+
+        if segment_ids is not None and segment_ids[idx] != segment_ids[idx - 1]:
+            state = TrajectoryState()
+            img_curr, pose_curr = parser[idx]
+            estimated_traj[idx] = state.t_pos.ravel()
+            gt_traj[idx] = pose_curr[:3, 3]
+            frame_times_sec[idx] = time.perf_counter() - t_frame_start
+            fps_per_frame[idx] = 1.0 / max(frame_times_sec[idx], 1e-9)
+            continue
+
         img_prev, pose_prev = parser[idx - 1]
         img_curr, pose_curr = parser[idx]
 
@@ -389,9 +441,18 @@ def run_detector_experiment(
         parser, matcher, estimator, max_frames=max_frames
     )
 
+    if hasattr(parser, "fit_odometry_to_world"):
+        estimated_traj, transforms = parser.fit_odometry_to_world(estimated_traj)
+        for idx, transform in enumerate(transforms, start=1):
+            logging.info(
+                f"  segment {idx}: scale={transform.scale:.6f}, rotation={np.rad2deg(transform.rotation_rad):.3f} deg, "
+                f"shift=({transform.translation_x:.3f}, {transform.translation_z:.3f})"
+            )
+
     valid = np.arange(len(metrics.fps_per_frame)) > 0
     avg_fps = float(np.mean(metrics.fps_per_frame[valid]))
-    ate_rmse = compute_ate_rmse(estimated_traj, gt_traj, start_idx=1)
+    ate_axes = (0, 2) if hasattr(parser, "fit_odometry_to_world") else None
+    ate_rmse = compute_ate_rmse(estimated_traj, gt_traj, start_idx=1, axes=ate_axes)
     pose_success_rate = float(np.mean(metrics.pose_success[valid]))
 
     turn_mask = detect_turn_frames(gt_traj, heading_threshold_deg=turn_heading_threshold_deg)
@@ -439,6 +500,39 @@ def plot_fps_histogram(results: List[ExperimentResult]):
     return fig
 
 
+def plot_fps_timeseries(results: List[ExperimentResult]):
+    """Показує FPS по кадрах, щоб бачити провали продуктивності."""
+    fig = plt.figure(figsize=(10, 5))
+    colors = {
+        "SIFT": "#1d3557",
+        "SURF": "#457b9d",
+        "ORB": "#e63946",
+        "OPTICAL_FLOW": "#2a9d8f",
+    }
+
+    for res in results:
+        fps = res.metrics.fps_per_frame
+        valid = np.isfinite(fps) & (fps > 0)
+        if not np.any(valid):
+            continue
+        x = np.arange(len(fps))[valid]
+        plt.plot(
+            x,
+            fps[valid],
+            label=res.detector_name,
+            color=colors.get(res.detector_name, None),
+            linewidth=1.4,
+            alpha=0.9,
+        )
+
+    plt.title("FPS by Frame")
+    plt.xlabel("Frame")
+    plt.ylabel("FPS")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    return fig
+
+
 def plot_trajectories(results: List[ExperimentResult]):
     """Порівняння траєкторій GT та оцінених траєкторій для всіх детекторів."""
     fig = plt.figure(figsize=(10, 7))
@@ -468,7 +562,80 @@ def plot_trajectories(results: List[ExperimentResult]):
     return fig
 
 if __name__ == "__main__":
-    parser_args = argparse.ArgumentParser(description="Motion Estimation with KITTI Dataset")
+    parser_args = argparse.ArgumentParser(description="Motion Estimation with KITTI або drone dataset")
+    parser_args.add_argument(
+        "--dataset_type",
+        type=str,
+        default="kitti",
+        choices=["kitti", "drone"],
+        help="Тип джерела даних"
+    )
+    parser_args.add_argument(
+        "--drone_video_path",
+        type=str,
+        default=None,
+        help="Шлях до відео дрона"
+    )
+    parser_args.add_argument(
+        "--drone_video_paths",
+        nargs="+",
+        default=None,
+        help="Список шляхів до відео дрона для окремих сегментів"
+    )
+    parser_args.add_argument(
+        "--drone_csv_path",
+        type=str,
+        default=None,
+        help="Шлях до CSV телеметрії дрона"
+    )
+    parser_args.add_argument(
+        "--start_frame",
+        type=int,
+        default=0,
+        help="Початковий кадр для drone-парсера"
+    )
+    parser_args.add_argument(
+        "--time_window_sec",
+        type=float,
+        default=5.0,
+        help="Розмір часовго вікна для drone-парсера"
+    )
+    parser_args.add_argument(
+        "--video_time_offset_sec",
+        type=float,
+        default=0.0,
+        help="Зсув часу між відео та CSV"
+    )
+    parser_args.add_argument(
+        "--segment_start_times_sec",
+        nargs="+",
+        type=float,
+        default=None,
+        help="Початок кожного відео в секундах CSV-логу"
+    )
+    parser_args.add_argument(
+        "--no_gimbal_orientation",
+        action="store_true",
+        help="Ігнорувати gimbal-орієнтацію для drone-парсера"
+    )
+    parser_args.add_argument(
+        "--fixed_down_pitch_deg",
+        type=float,
+        default=-90.0,
+        help="Фіксований pitch для downward-looking камери"
+    )
+    parser_args.add_argument(
+        "--sequence",
+        type=str,
+        default="00",
+        help="KITTI sequence"
+    )
+    parser_args.add_argument(
+        "--camera",
+        type=str,
+        default="image_0",
+        help="KITTI camera folder"
+    )
     parser_args.add_argument(
         "--max_frames", type=int, default=None,
         help="Максимальна кількість кадрів для обробки (None для всіх кадрів)"
@@ -492,18 +659,18 @@ if __name__ == "__main__":
     args = parser_args.parse_args()
 
     DATASET_PATH = "dataset/"
-    SEQUENCE = "00"
-    CAMERA = "image_0"
-
-    parser = KITTIOdometryParser(DATASET_PATH, sequence=SEQUENCE, camera=CAMERA)
+    parser = build_parser(args, dataset_path=DATASET_PATH)
     logging.info(parser.summary())
 
-    calib_path = DATASET_PATH + f"sequences/{SEQUENCE}/calib.txt"
-    K = load_camera_matrix(calib_path, camera_id=0)
+    if args.dataset_type == "drone":
+        K = parser.K
+    else:
+        calib_path = DATASET_PATH + f"sequences/{args.sequence}/calib.txt"
+        K = load_camera_matrix(calib_path, camera_id=0)
     logging.info("Матриця камери K:")
     logging.info(K)
 
-    estimator = MotionEstimator(K)
+    estimator = MotionEstimator(K, use_ground_truth_scale=(args.dataset_type != "drone"))
     max_frames = args.max_frames if args.max_frames is not None else len(parser)
 
     selected_detectors: List[DetectorType] = []
@@ -543,15 +710,19 @@ if __name__ == "__main__":
         )
 
     fps_fig = plot_fps_histogram(results)
+    fps_ts_fig = plot_fps_timeseries(results)
     traj_fig = plot_trajectories(results)
 
     if args.save_plots_dir:
         os.makedirs(args.save_plots_dir, exist_ok=True)
         fps_path = os.path.join(args.save_plots_dir, "fps_histogram.png")
+        fps_ts_path = os.path.join(args.save_plots_dir, "fps_timeseries.png")
         traj_path = os.path.join(args.save_plots_dir, "trajectories_comparison.png")
         fps_fig.savefig(fps_path, dpi=150, bbox_inches="tight")
+        fps_ts_fig.savefig(fps_ts_path, dpi=150, bbox_inches="tight")
         traj_fig.savefig(traj_path, dpi=150, bbox_inches="tight")
         logging.info(f"Збережено графік FPS: {fps_path}")
+        logging.info(f"Збережено графік FPS по кадрах: {fps_ts_path}")
         logging.info(f"Збережено графік траєкторій: {traj_path}")
 
     if not args.no_plot:
