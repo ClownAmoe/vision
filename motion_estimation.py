@@ -72,6 +72,7 @@ def compute_ate_rmse(
     gt_traj: np.ndarray,
     start_idx: int = 1,
     axes: Optional[Tuple[int, ...]] = None,
+    axis_scales: Optional[Tuple[float, ...]] = None,
 ) -> float:
     """
     Absolute Trajectory Error (ATE) у формі RMSE.
@@ -82,6 +83,13 @@ def compute_ate_rmse(
     if axes is not None:
         est = est[:, axes]
         gt = gt[:, axes]
+
+    if axis_scales is not None:
+        scales = np.asarray(axis_scales, dtype=np.float64)
+        if est.shape[1] != len(scales):
+            raise ValueError("axis_scales must match the number of selected axes")
+        est = est * scales
+        gt = gt * scales
 
     if est.size == 0 or gt.size == 0:
         return float("nan")
@@ -191,6 +199,7 @@ def build_parser(args, dataset_path: str = "dataset/"):
             use_gimbal_orientation=not args.no_gimbal_orientation,
             fixed_down_pitch_deg=args.fixed_down_pitch_deg,
             segment_start_times_sec=segment_starts,
+            drone_fov_deg=args.drone_fov_deg,
         )
 
     return KITTIOdometryParser(dataset_path, sequence=args.sequence, camera=args.camera)
@@ -343,11 +352,14 @@ def run_odometry_pipeline(
 ) -> Tuple[np.ndarray, np.ndarray, PipelineMetrics]:
     """
     Повний прохід по датасету: видобуток ознак → оцінка руху → траєкторія.
+    
+    Для дрона: накопичуємо тільки переклади (без матриці R) - обчисліть перетворення потім через fit_odometry_to_world
+    Для KITTI: нормально накопичуємо рухи з матриці R
 
     Returns
     -------
-    estimated_traj : (N, 3) — обчислена траєкторія (x, y, z)
-    gt_traj        : (N, 3) — Ground Truth траєкторія
+    estimated_traj : (N, 3) — обчислена траєкторія (x, y, z) у системі камери
+    gt_traj        : (N, 3) — Ground Truth: GPS/odometry у метрах
     """
     n = len(parser) if max_frames is None else min(max_frames, len(parser))
 
@@ -360,19 +372,24 @@ def run_odometry_pipeline(
 
     state = TrajectoryState()
     segment_ids = getattr(parser, "_sample_segment_ids", None)
+    is_drone = hasattr(parser, "_sample_world_xy")
+    drone_dir_xz = np.array([0.0, 1.0], dtype=np.float64)
 
     img0, pose0 = parser[0]
     _ = img0
     gt_traj[0] = pose0[:3, 3]
+    estimated_traj[0] = 0.0  # VO траєкторія починається з нуля
 
     for idx in range(1, n):
         t_frame_start = time.perf_counter()
 
         if segment_ids is not None and segment_ids[idx] != segment_ids[idx - 1]:
+            # Нова камера/сегмент - скинемо стан VO
             state = TrajectoryState()
+            drone_dir_xz = np.array([0.0, 1.0], dtype=np.float64)
             img_curr, pose_curr = parser[idx]
-            estimated_traj[idx] = state.t_pos.ravel()
             gt_traj[idx] = pose_curr[:3, 3]
+            estimated_traj[idx] = 0.0
             frame_times_sec[idx] = time.perf_counter() - t_frame_start
             fps_per_frame[idx] = 1.0 / max(frame_times_sec[idx], 1e-9)
             continue
@@ -396,11 +413,42 @@ def run_odometry_pipeline(
         )
 
         if estimate is not None:
-            state = MotionEstimator.update_trajectory(state, estimate)
+            if is_drone:
+                # ДЛЯ ДРОНА: крок беремо за нормою, а напрям - зі згладженого t(x,z).
+                # Так зберігаємо повороти без накопичення глобальної R-матриці.
+                t = estimate.t.ravel()
+                step_norm = float(np.linalg.norm(t))
+
+                raw_dir_xz = np.array([float(t[0]), float(t[2])], dtype=np.float64)
+                raw_norm = float(np.linalg.norm(raw_dir_xz))
+                if raw_norm > 1e-9:
+                    raw_unit = raw_dir_xz / raw_norm
+
+                    # Прибираємо випадкові фліпи напряму (двозначність Essential Matrix).
+                    if float(np.dot(raw_unit, drone_dir_xz)) < -0.2:
+                        raw_unit = -raw_unit
+
+                    alpha_dir = 0.08
+                    drone_dir_xz = (1.0 - alpha_dir) * drone_dir_xz + alpha_dir * raw_unit
+                    dir_norm = float(np.linalg.norm(drone_dir_xz))
+                    if dir_norm > 1e-9:
+                        drone_dir_xz = drone_dir_xz / dir_norm
+
+                step_xz = step_norm * drone_dir_xz
+                estimated_traj[idx] = estimated_traj[idx - 1] + np.array([step_xz[0], 0.0, step_xz[1]])
+            else:
+                # Для KITTI: нормально накопичуємо рухи з матриці R
+                state = MotionEstimator.update_trajectory(state, estimate)
+                estimated_traj[idx] = state.t_pos.ravel()
+            
             pose_success[idx] = True
             inliers_per_frame[idx] = int(estimate.n_inliers)
+        else:
+            if is_drone:
+                estimated_traj[idx] = estimated_traj[idx - 1]
+            else:
+                estimated_traj[idx] = state.t_pos.ravel()
 
-        estimated_traj[idx] = state.t_pos.ravel()
         gt_traj[idx]        = pose_curr[:3, 3]
         frame_times_sec[idx] = time.perf_counter() - t_frame_start
         fps_per_frame[idx] = 1.0 / max(frame_times_sec[idx], 1e-9)
@@ -409,8 +457,9 @@ def run_odometry_pipeline(
             err = np.linalg.norm(estimated_traj[idx] - gt_traj[idx])
             print(
                 f"[{idx:04d}/{n}]  "
-                f"pos=({state.t_pos[0,0]:7.1f}, {state.t_pos[2,0]:7.1f})  "
-                f"err={err:.2f} m"
+                f"vo_pos=({estimated_traj[idx,0]:8.2f}, {estimated_traj[idx,2]:8.2f})  "
+                f"gps_pos=({gt_traj[idx,0]:8.2f}, {gt_traj[idx,2]:8.2f})  "
+                f"err={err:.3f} m"
             )
 
     metrics = PipelineMetrics(
@@ -452,7 +501,15 @@ def run_detector_experiment(
     valid = np.arange(len(metrics.fps_per_frame)) > 0
     avg_fps = float(np.mean(metrics.fps_per_frame[valid]))
     ate_axes = (0, 2) if hasattr(parser, "fit_odometry_to_world") else None
-    ate_rmse = compute_ate_rmse(estimated_traj, gt_traj, start_idx=1, axes=ate_axes)
+    # Для дрона: GPS вже в метрах, тому не множимо на масштаби
+    ate_axis_scales = None
+    ate_rmse = compute_ate_rmse(
+        estimated_traj,
+        gt_traj,
+        start_idx=1,
+        axes=ate_axes,
+        axis_scales=ate_axis_scales,
+    )
     pose_success_rate = float(np.mean(metrics.pose_success[valid]))
 
     turn_mask = detect_turn_frames(gt_traj, heading_threshold_deg=turn_heading_threshold_deg)
@@ -533,7 +590,7 @@ def plot_fps_timeseries(results: List[ExperimentResult]):
     return fig
 
 
-def plot_trajectories(results: List[ExperimentResult]):
+def plot_trajectories(results: List[ExperimentResult], x_label: str = "X Position", y_label: str = "Z Position"):
     """Порівняння траєкторій GT та оцінених траєкторій для всіх детекторів."""
     fig = plt.figure(figsize=(10, 7))
     gt = results[0].gt_traj
@@ -555,8 +612,8 @@ def plot_trajectories(results: List[ExperimentResult]):
         )
 
     plt.title("Ground Truth vs Estimated Trajectories")
-    plt.xlabel("X Position (meters)")
-    plt.ylabel("Z Position (meters)")
+    plt.xlabel(x_label)
+    plt.ylabel(y_label)
     plt.legend()
     plt.grid(True)
     return fig
@@ -656,6 +713,10 @@ if __name__ == "__main__":
         "--save_plots_dir", type=str, default=None,
         help="Папка для збереження графіків (PNG)"
     )
+    parser_args.add_argument(
+        "--drone_fov_deg", type=float, default=84.0,
+        help="Припущений FOV камери дрона для розрахунку фокусної відстані"
+    )
     args = parser_args.parse_args()
 
     DATASET_PATH = "dataset/"
@@ -711,7 +772,10 @@ if __name__ == "__main__":
 
     fps_fig = plot_fps_histogram(results)
     fps_ts_fig = plot_fps_timeseries(results)
-    traj_fig = plot_trajectories(results)
+    if args.dataset_type == "drone":
+        traj_fig = plot_trajectories(results, x_label="X Position (m)", y_label="Y Position (m)")
+    else:
+        traj_fig = plot_trajectories(results)
 
     if args.save_plots_dir:
         os.makedirs(args.save_plots_dir, exist_ok=True)

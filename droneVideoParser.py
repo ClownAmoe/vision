@@ -76,6 +76,7 @@ class DroneVideoCSVParser:
         fixed_down_pitch_deg: float = -90.0,
         video_paths: Optional[Sequence[Union[str, Path]]] = None,
         segment_start_times_sec: Optional[Sequence[float]] = None,
+        drone_fov_deg: float = 84.0,
     ):
         if csv_path is None:
             raise ValueError("csv_path is required")
@@ -86,6 +87,7 @@ class DroneVideoCSVParser:
         self.video_time_offset_sec = float(video_time_offset_sec)
         self.use_gimbal_orientation = bool(use_gimbal_orientation)
         self.fixed_down_pitch_deg = float(fixed_down_pitch_deg)
+        self.drone_fov_deg = float(drone_fov_deg)
 
         if video_paths is not None:
             self.video_paths = [Path(path) for path in video_paths]
@@ -124,7 +126,7 @@ class DroneVideoCSVParser:
 
         self._frame_global_offset = 0
         self._length = len(self._sample_segment_ids)
-        self.K = camera_matrix if camera_matrix is not None else self._default_k()
+        self.K = camera_matrix if camera_matrix is not None else self._default_k(fov_deg=self.drone_fov_deg)
 
         self._next_frame_idx = 0
         self._current_frame = None
@@ -194,15 +196,31 @@ class DroneVideoCSVParser:
         self.lat_scale_m = self._meters_per_degree_lat(self.origin_lat)
         self.lon_scale_m = self._meters_per_degree_lon(self.origin_lat)
 
-        east = (self.longitudes - self.origin_lon) * self.lon_scale_m
-        north = (self.latitudes - self.origin_lat) * self.lat_scale_m
-        self.world_xy_m = np.column_stack((east, north)).astype(np.float64)
+        self.gps_lonlat_deg = np.column_stack((self.longitudes, self.latitudes)).astype(np.float64)
+        self.gps_local_xy_m = np.column_stack(
+            (
+                (self.longitudes - self.origin_lon) * self.lon_scale_m,
+                (self.latitudes - self.origin_lat) * self.lat_scale_m,
+            )
+        ).astype(np.float64)
 
     def _interpolate_world_xy(self, query_times_sec: np.ndarray) -> np.ndarray:
+        """
+        Інтерпольовує GPS координати в локальну систему (метри від походження).
+        
+        Returns
+        -------
+        (N, 2) масив координат у метрах: (x_m, y_m) від походження
+        """
         query_times_sec = np.asarray(query_times_sec, dtype=np.float64)
-        east = np.interp(query_times_sec, self.fly_time_sec, self.world_xy_m[:, 0])
-        north = np.interp(query_times_sec, self.fly_time_sec, self.world_xy_m[:, 1])
-        return np.column_stack((east, north)).astype(np.float64)
+        lon = np.interp(query_times_sec, self.fly_time_sec, self.gps_lonlat_deg[:, 0])
+        lat = np.interp(query_times_sec, self.fly_time_sec, self.gps_lonlat_deg[:, 1])
+        
+        # Конвертуємо у метри від походження
+        x_m = (lon - self.origin_lon) * self.lon_scale_m
+        y_m = (lat - self.origin_lat) * self.lat_scale_m
+        
+        return np.column_stack((x_m, y_m)).astype(np.float64)
 
     @staticmethod
     def _unwrap_yaw(euler_deg: np.ndarray) -> np.ndarray:
@@ -423,18 +441,38 @@ class DroneVideoCSVParser:
     def K(self, mat):
         self._K = np.array(mat, dtype=np.float64)
 
-    def _default_k(self) -> np.ndarray:
+    def _default_k(self, fov_deg: float = 84.0) -> np.ndarray:
+        """
+        Розраховує матрицю калібрування K для камери дрона на основі:
+        - Фактичних розмірів кадру
+        - Припущеного поля зору (FOV)
+        
+        DJI дрони типово мають FOV ~84°.
+        
+        Формула: fx = (width / 2) / tan(FOV / 2)
+        """
         first_cap = self.cap_list[0]
         width = int(first_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(first_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fx = fy = 1400.0
+        
+        # Розраховуємо фокусну відстань на основі FOV
+        fov_rad = math.radians(fov_deg)
+        fx = (width / 2.0) / math.tan(fov_rad / 2.0)
+        fy = fx  # Припускаємо квадратні пікселі
+        
         cx, cy = width / 2.0, height / 2.0
-        return np.array(
+        
+        K = np.array(
             [[fx, 0.0, cx],
              [0.0, fy, cy],
              [0.0, 0.0, 1.0]],
             dtype=np.float64,
         )
+        
+        print(f"[DroneVideoParser] Розраховано матрицю K: "
+              f"{width}x{height}, FOV={fov_deg}°, fx/fy={fx:.1f}")
+        
+        return K
 
     def fit_odometry_to_world(self, odom_traj: np.ndarray) -> Tuple[np.ndarray, List[TrajectoryTransform2D]]:
         """Align odometry trajectory to GPS-derived world coordinates segment by segment."""
@@ -448,6 +486,7 @@ class DroneVideoCSVParser:
 
         aligned = odom_traj[:n].copy()
         transforms: List[TrajectoryTransform2D] = []
+        local_fit_window = 120
 
         for start, end in self._segment_ranges:
             if start >= n:
@@ -456,14 +495,33 @@ class DroneVideoCSVParser:
             if end <= start:
                 continue
 
-            odom_segment = odom_traj[start : end + 1]
-            gps_segment = self._sample_world_xy[start : end + 1]
-            transform = self._fit_similarity_transform_2d(odom_segment[:, (0, 2)], gps_segment)
-            transformed_xy = transform.apply(odom_segment[:, (0, 2)])
+            previous_xy_end: Optional[np.ndarray] = None
+            first_transform: Optional[TrajectoryTransform2D] = None
 
-            aligned[start : end + 1, 0] = transformed_xy[:, 0]
-            aligned[start : end + 1, 2] = transformed_xy[:, 1]
-            transforms.append(transform)
+            for chunk_start in range(start, end + 1, local_fit_window):
+                chunk_end = min(chunk_start + local_fit_window - 1, end)
+                if chunk_end <= chunk_start:
+                    continue
+
+                odom_chunk = odom_traj[chunk_start : chunk_end + 1]
+                gps_chunk = self._sample_world_xy[chunk_start : chunk_end + 1]
+                transform = self._fit_similarity_transform_2d(odom_chunk[:, (0, 2)], gps_chunk)
+                transformed_xy = transform.apply(odom_chunk[:, (0, 2)])
+
+                if previous_xy_end is not None:
+                    continuity_offset = previous_xy_end - transformed_xy[0]
+                    transformed_xy = transformed_xy + continuity_offset
+
+                aligned[chunk_start : chunk_end + 1, 0] = transformed_xy[:, 0]
+                aligned[chunk_start : chunk_end + 1, 2] = transformed_xy[:, 1]
+                previous_xy_end = transformed_xy[-1]
+
+                if first_transform is None:
+                    first_transform = transform
+
+            if first_transform is None:
+                first_transform = TrajectoryTransform2D(scale=1.0, rotation_rad=0.0, translation_x=0.0, translation_z=0.0)
+            transforms.append(first_transform)
 
         if n < len(odom_traj):
             aligned = np.vstack([aligned, odom_traj[n:]])
@@ -488,7 +546,7 @@ class DroneVideoCSVParser:
 
         if len(self._sample_world_xy) > 0:
             lines.append(
-                f"  Start pos : east={self._sample_world_xy[0, 0]:.3f} m, north={self._sample_world_xy[0, 1]:.3f} m"
+                f"  Start pos : lon={self._sample_world_xy[0, 0]:.7f}, lat={self._sample_world_xy[0, 1]:.7f}"
             )
 
         return "\n".join(lines)
