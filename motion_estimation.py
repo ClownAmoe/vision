@@ -349,6 +349,7 @@ def run_odometry_pipeline(
     feature_matcher,
     estimator: MotionEstimator,
     max_frames: Optional[int] = None,
+    frame_skip: int = 1,
 ) -> Tuple[np.ndarray, np.ndarray, PipelineMetrics]:
     """
     Повний прохід по датасету: видобуток ознак → оцінка руху → траєкторія.
@@ -361,10 +362,20 @@ def run_odometry_pipeline(
     estimated_traj : (N, 3) — обчислена траєкторія (x, y, z) у системі камери
     gt_traj        : (N, 3) — Ground Truth: GPS/odometry у метрах
     """
-    n = len(parser) if max_frames is None else min(max_frames, len(parser))
+    if frame_skip <= 0:
+        raise ValueError("frame_skip must be >= 1")
+
+    # Build list of frame indices we will actually process (apply skip)
+    all_indices = list(range(0, len(parser), frame_skip))
+    if max_frames is None:
+        selected_indices = all_indices
+    else:
+        selected_indices = all_indices[:max_frames]
+
+    n = len(selected_indices)
 
     estimated_traj = np.zeros((n, 3), dtype=np.float64)
-    gt_traj        = np.zeros((n, 3), dtype=np.float64)
+    gt_traj = np.zeros((n, 3), dtype=np.float64)
     frame_times_sec = np.zeros(n, dtype=np.float64)
     fps_per_frame = np.zeros(n, dtype=np.float64)
     pose_success = np.zeros(n, dtype=bool)
@@ -375,34 +386,45 @@ def run_odometry_pipeline(
     is_drone = hasattr(parser, "_sample_world_xy")
     drone_dir_xz = np.array([0.0, 1.0], dtype=np.float64)
 
-    img0, pose0 = parser[0]
+    if n == 0:
+        return estimated_traj, gt_traj, PipelineMetrics(
+            frame_times_sec=frame_times_sec,
+            fps_per_frame=fps_per_frame,
+            pose_success=pose_success,
+            inliers_per_frame=inliers_per_frame,
+        )
+
+    first_idx = selected_indices[0]
+    img0, pose0 = parser[first_idx]
     _ = img0
     gt_traj[0] = pose0[:3, 3]
     estimated_traj[0] = 0.0  # VO траєкторія починається з нуля
 
-    for idx in range(1, n):
+    for out_i in range(1, n):
         t_frame_start = time.perf_counter()
+        idx = selected_indices[out_i]
+        prev_idx = selected_indices[out_i - 1]
 
-        if segment_ids is not None and segment_ids[idx] != segment_ids[idx - 1]:
+        if segment_ids is not None and segment_ids[idx] != segment_ids[prev_idx]:
             # Нова камера/сегмент - скинемо стан VO
             state = TrajectoryState()
             drone_dir_xz = np.array([0.0, 1.0], dtype=np.float64)
             img_curr, pose_curr = parser[idx]
-            gt_traj[idx] = pose_curr[:3, 3]
-            estimated_traj[idx] = 0.0
-            frame_times_sec[idx] = time.perf_counter() - t_frame_start
-            fps_per_frame[idx] = 1.0 / max(frame_times_sec[idx], 1e-9)
+            gt_traj[out_i] = pose_curr[:3, 3]
+            estimated_traj[out_i] = 0.0
+            frame_times_sec[out_i] = time.perf_counter() - t_frame_start
+            fps_per_frame[out_i] = 1.0 / max(frame_times_sec[out_i], 1e-9)
             continue
 
-        img_prev, pose_prev = parser[idx - 1]
+        img_prev, pose_prev = parser[prev_idx]
         img_curr, pose_curr = parser[idx]
 
         match_result = feature_matcher.match(img_prev, img_curr)
         if match_result is None:
-            estimated_traj[idx] = estimated_traj[idx - 1]
-            gt_traj[idx]        = pose_curr[:3, 3]
-            frame_times_sec[idx] = time.perf_counter() - t_frame_start
-            fps_per_frame[idx] = 1.0 / max(frame_times_sec[idx], 1e-9)
+            estimated_traj[out_i] = estimated_traj[out_i - 1]
+            gt_traj[out_i] = pose_curr[:3, 3]
+            frame_times_sec[out_i] = time.perf_counter() - t_frame_start
+            fps_per_frame[out_i] = 1.0 / max(frame_times_sec[out_i], 1e-9)
             continue
 
         estimate = estimator.estimate(
@@ -435,30 +457,29 @@ def run_odometry_pipeline(
                         drone_dir_xz = drone_dir_xz / dir_norm
 
                 step_xz = step_norm * drone_dir_xz
-                estimated_traj[idx] = estimated_traj[idx - 1] + np.array([step_xz[0], 0.0, step_xz[1]])
+                estimated_traj[out_i] = estimated_traj[out_i - 1] + np.array([step_xz[0], 0.0, step_xz[1]])
             else:
                 # Для KITTI: нормально накопичуємо рухи з матриці R
                 state = MotionEstimator.update_trajectory(state, estimate)
-                estimated_traj[idx] = state.t_pos.ravel()
+                estimated_traj[out_i] = state.t_pos.ravel()
             
-            pose_success[idx] = True
-            inliers_per_frame[idx] = int(estimate.n_inliers)
+            pose_success[out_i] = True
+            inliers_per_frame[out_i] = int(estimate.n_inliers)
         else:
             if is_drone:
-                estimated_traj[idx] = estimated_traj[idx - 1]
+                estimated_traj[out_i] = estimated_traj[out_i - 1]
             else:
-                estimated_traj[idx] = state.t_pos.ravel()
+                estimated_traj[out_i] = state.t_pos.ravel()
+        gt_traj[out_i] = pose_curr[:3, 3]
+        frame_times_sec[out_i] = time.perf_counter() - t_frame_start
+        fps_per_frame[out_i] = 1.0 / max(frame_times_sec[out_i], 1e-9)
 
-        gt_traj[idx]        = pose_curr[:3, 3]
-        frame_times_sec[idx] = time.perf_counter() - t_frame_start
-        fps_per_frame[idx] = 1.0 / max(frame_times_sec[idx], 1e-9)
-
-        if idx % 100 == 0:
-            err = np.linalg.norm(estimated_traj[idx] - gt_traj[idx])
+        if out_i % 100 == 0:
+            err = np.linalg.norm(estimated_traj[out_i] - gt_traj[out_i])
             print(
-                f"[{idx:04d}/{n}]  "
-                f"vo_pos=({estimated_traj[idx,0]:8.2f}, {estimated_traj[idx,2]:8.2f})  "
-                f"gps_pos=({gt_traj[idx,0]:8.2f}, {gt_traj[idx,2]:8.2f})  "
+                f"[{out_i:04d}/{n}]  "
+                f"vo_pos=({estimated_traj[out_i,0]:8.2f}, {estimated_traj[out_i,2]:8.2f})  "
+                f"gps_pos=({gt_traj[out_i,0]:8.2f}, {gt_traj[out_i,2]:8.2f})  "
                 f"err={err:.3f} m"
             )
 
@@ -476,6 +497,7 @@ def run_detector_experiment(
     estimator: MotionEstimator,
     detector_type: DetectorType,
     max_frames: Optional[int] = None,
+    frame_skip: int = 1,
     turn_heading_threshold_deg: float = 1.5,
 ) -> Optional[ExperimentResult]:
     """Запускає повний експеримент для одного детектора."""
@@ -487,7 +509,7 @@ def run_detector_experiment(
 
     logging.info(f"\n=== Експеримент: {detector_type.name} ===")
     estimated_traj, gt_traj, metrics = run_odometry_pipeline(
-        parser, matcher, estimator, max_frames=max_frames
+        parser, matcher, estimator, max_frames=max_frames, frame_skip=frame_skip
     )
 
     if hasattr(parser, "fit_odometry_to_world"):
@@ -698,6 +720,10 @@ if __name__ == "__main__":
         help="Максимальна кількість кадрів для обробки (None для всіх кадрів)"
     )
     parser_args.add_argument(
+        "--frame_skip", type=int, default=1,
+        help="Обробляти кожен N-тий кадр (1 = без пропусків)"
+    )
+    parser_args.add_argument(
         "--detectors", nargs="+", default=["SIFT", "SURF", "ORB", "OPTICAL_FLOW"],
         help="Список детекторів для тесту: SIFT SURF ORB OPTICAL_FLOW"
     )
@@ -752,6 +778,7 @@ if __name__ == "__main__":
             estimator=estimator,
             detector_type=detector,
             max_frames=max_frames,
+            frame_skip=args.frame_skip,
             turn_heading_threshold_deg=args.turn_heading_threshold_deg,
         )
         if result is not None:
