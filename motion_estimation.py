@@ -15,6 +15,7 @@ from kitti_parser import KITTIOdometryParser
 from droneVideoParser import DroneVideoCSVParser
 from feature_matching import FeatureMatcher, DetectorType
 import matplotlib.pyplot as plt
+import matplotlib.patheffects as pe
 import argparse
 import logging
 
@@ -561,7 +562,7 @@ def plot_fps_histogram(results: List[ExperimentResult]):
         "SIFT": "#2a9d8f",
         "SURF": "#e9c46a",
         "ORB": "#e76f51",
-        "OPTICAL_FLOW": "#264653",
+        "OPTICAL_FLOW": "#FFD700",
     }
     colors = [color_map.get(name, "#6c757d") for name in names]
     bars = plt.bar(names, fps_values, color=colors)
@@ -586,7 +587,7 @@ def plot_fps_timeseries(results: List[ExperimentResult]):
         "SIFT": "#1d3557",
         "SURF": "#457b9d",
         "ORB": "#e63946",
-        "OPTICAL_FLOW": "#2a9d8f",
+        "OPTICAL_FLOW": "#FFD700",
     }
 
     for res in results:
@@ -622,7 +623,7 @@ def plot_trajectories(results: List[ExperimentResult], x_label: str = "X Positio
         "SIFT": "#1d3557",
         "SURF": "#457b9d",
         "ORB": "#e63946",
-        "OPTICAL_FLOW": "#2a9d8f",
+        "OPTICAL_FLOW": "#FFD700",
     }
     for res in results:
         plt.plot(
@@ -638,6 +639,100 @@ def plot_trajectories(results: List[ExperimentResult], x_label: str = "X Positio
     plt.ylabel(y_label)
     plt.legend()
     plt.grid(True)
+    return fig
+
+
+def plot_trajectories_on_background(
+    results: List[ExperimentResult],
+    background_path: Union[str, Path],
+    padding_m: float = 18.0,
+    alpha: float = 0.98,
+    x_label: str = "X Position (m)",
+    y_label: str = "Y Position (m)",
+):
+    """Накладає GT та VO на фон-карту або скриншот."""
+    background_path = Path(background_path)
+    if not background_path.exists():
+        raise FileNotFoundError(f"Background map not found: {background_path}")
+
+    background = plt.imread(str(background_path))
+    fig = plt.figure(figsize=(11, 8))
+    ax = plt.gca()
+
+    gt = results[0].gt_traj
+    all_x = [gt[:, 0]]
+    all_y = [gt[:, 2]]
+    for res in results:
+        all_x.append(res.estimated_traj[:, 0])
+        all_y.append(res.estimated_traj[:, 2])
+
+    x_min_raw = float(np.nanmin(np.concatenate(all_x)))
+    x_max_raw = float(np.nanmax(np.concatenate(all_x)))
+    y_min_raw = float(np.nanmin(np.concatenate(all_y)))
+    y_max_raw = float(np.nanmax(np.concatenate(all_y)))
+
+    x_pad = float(padding_m)
+    y_pad = float(padding_m)
+    x_min = x_min_raw - x_pad
+    x_max = x_max_raw + x_pad
+    y_min = y_min_raw - y_pad
+    y_max = y_max_raw + y_pad
+
+    ax.imshow(
+        background,
+        extent=(x_min, x_max, y_min, y_max),
+        origin="upper",
+        alpha=alpha,
+    )
+
+    colors = {
+        "SIFT": "#1d3557",
+        "SURF": "#457b9d",
+        "ORB": "#e63946",
+        "OPTICAL_FLOW": "#FFD700",
+    }
+
+    ax.plot(
+        gt[:, 0],
+        gt[:, 2],
+        label="Еталонна траєкторія",
+        color="white",
+        linewidth=5.0,
+        alpha=0.85,
+        zorder=3,
+        path_effects=[pe.Stroke(linewidth=7.5, foreground="black", alpha=0.25), pe.Normal()],
+    )
+    ax.plot(gt[:, 0], gt[:, 2], color="black", linewidth=2.4, zorder=4)
+    ax.scatter(gt[0, 0], gt[0, 2], s=70, color="#00cc66", edgecolor="white", linewidth=1.2, zorder=5, label="Старт")
+    ax.scatter(gt[-1, 0], gt[-1, 2], s=70, color="#ff5a36", edgecolor="white", linewidth=1.2, zorder=5, label="Фініш")
+
+    for res in results:
+        ax.plot(
+            res.estimated_traj[:, 0],
+            res.estimated_traj[:, 2],
+            color="black",
+            linewidth=4.2,
+            alpha=0.18,
+            zorder=2,
+        )
+        ax.plot(
+            res.estimated_traj[:, 0],
+            res.estimated_traj[:, 2],
+            label=f"{res.detector_name} (ATE={res.ate_rmse:.2f} м)",
+            linestyle="--",
+            color=colors.get(res.detector_name, None),
+            linewidth=2.4,
+            zorder=4,
+        )
+
+    ax.set_title("Накладання траєкторій на карту")
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_xlabel("")
+    ax.set_ylabel("")
+    ax.grid(False)
+    ax.legend(loc="best", framealpha=0.9, facecolor="white", edgecolor="#d0d0d0")
     return fig
 
 if __name__ == "__main__":
@@ -740,6 +835,14 @@ if __name__ == "__main__":
         help="Папка для збереження графіків (PNG)"
     )
     parser_args.add_argument(
+        "--background_map_path", type=str, default=None,
+        help="Шлях до скриншота або карти, на яку треба накласти траєкторії"
+    )
+    parser_args.add_argument(
+        "--background_map_padding_m", type=float, default=0.0,
+        help="Додатковий запас у метрах навколо траєкторії для фону"
+    )
+    parser_args.add_argument(
         "--drone_fov_deg", type=float, default=84.0,
         help="Припущений FOV камери дрона для розрахунку фокусної відстані"
     )
@@ -799,7 +902,13 @@ if __name__ == "__main__":
 
     fps_fig = plot_fps_histogram(results)
     fps_ts_fig = plot_fps_timeseries(results)
-    if args.dataset_type == "drone":
+    if args.background_map_path:
+        traj_fig = plot_trajectories_on_background(
+            results,
+            args.background_map_path,
+            padding_m=args.background_map_padding_m,
+        )
+    elif args.dataset_type == "drone":
         traj_fig = plot_trajectories(results, x_label="X Position (m)", y_label="Y Position (m)")
     else:
         traj_fig = plot_trajectories(results)

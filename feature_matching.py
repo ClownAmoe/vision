@@ -117,9 +117,15 @@ class FeatureMatcher:
         sift_n: int,
     ):
         if det_type == DetectorType.SIFT:
-            return cv2.xfeatures2d.SIFT_create(nfeatures=sift_n)
+            if hasattr(cv2, "SIFT_create"):
+                return cv2.SIFT_create(nfeatures=sift_n)
+            if hasattr(cv2, "xfeatures2d") and hasattr(cv2.xfeatures2d, "SIFT_create"):
+                return cv2.xfeatures2d.SIFT_create(nfeatures=sift_n)
+            raise cv2.error("SIFT is not available in this OpenCV build")
         elif det_type == DetectorType.SURF:
-            return cv2.xfeatures2d.SURF_create(hessianThreshold=surf_thresh)
+            if hasattr(cv2, "xfeatures2d") and hasattr(cv2.xfeatures2d, "SURF_create"):
+                return cv2.xfeatures2d.SURF_create(hessianThreshold=surf_thresh)
+            raise cv2.error("SURF is not available in this OpenCV build")
         elif det_type == DetectorType.ORB:
             return cv2.ORB_create(nfeatures=orb_n)
         elif det_type == DetectorType.OPTICAL_FLOW:
